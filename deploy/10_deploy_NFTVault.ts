@@ -57,7 +57,6 @@ task("deploy-nftVault", "Deploys the NFTVault contract")
 			config.peth,
 			vaultConfig.nft,
 			vaultConfig.nftValueProvider,
-			config.cigStaking,
 			[
 				vaultConfig.debtInterestApr,
 				vaultConfig.creditLimitRate,
@@ -163,8 +162,14 @@ task("deploy-nftprovider", "Deploys the NFTValueProvider contract")
 		const nftValueprovider = await upgrades.deployProxy(NFTValueProvider, [
 			config.jpeg,
 			vaultConfig.jpegOraclesAggregator,
+			config.cigStaking,
+			vaultConfig.creditLimitRate,
+			vaultConfig.liquidationLimitRate,
 			vaultConfig.valueIncreaseLockRate,
-			"0",
+			vaultConfig.jpegLockedRateIncrease,
+			vaultConfig.traitBoostLockRate,
+			vaultConfig.ltvBoostLockRate,
+			"0"
 		]);
 		console.log("deployed at: ", nftValueprovider.address)
 
