@@ -1,6 +1,8 @@
 import fs from "fs";
 import path from "path";
+import { getProxyAdminFactory } from "@openzeppelin/hardhat-upgrades/dist/utils";
 import { task, types } from "hardhat/config";
+
 import { DAO_ROLE } from "./constants";
 
 task("deploy-nftVault", "Deploys the NFTVault contract")
@@ -201,3 +203,75 @@ task("deploy-providerImpl", "Upgrades the NFTVault contract")
 		});
 	}
 })
+
+task("update-nftVaultImpl", "Upgrades the NFTVault contract")
+	.setAction(async ({}, hre) => {
+		const { network, ethers, run, upgrades } = hre
+		const [deployer] = await ethers.getSigners();
+		console.log("Deployer: ", deployer.address);
+		
+		const ProxyAdmin = await getProxyAdminFactory(hre);
+		const proxyAdmin = ProxyAdmin.attach("0x01117554764418EAc866F4701f6438c06b28d5F2");
+
+		const proxies = [
+			["0x33c52E377CF7D76a97b93C337cDd1a42c9dDE019", "NFTVault"],
+			["0x4D057e43316058F4Ae2199954f79dD19952a548B", "NFTVault"],
+			["0x26916b8F7f76cF2b5FeD919A97E66acdb83Fbe80", "NFTVault"],
+			["0x601666b790CE63c221266BcC4fecBB505DdC31cb", "NFTVault"],
+			["0x148266c9EB56D03D5B2425610C828144A4DeF702", "PETHNFTVault"],
+			["0x06Fe4b4b7646FD6E33bFd27245386E5E30e43F02", "PETHNFTVault"], // punks peth 2
+			["0xAF887649F859921614Fd018cFB32E27DA6547093", "PETHNFTVault"], // bayc peth
+			["0x3c1fE934a1918FDaAA7264B7AdF7eF2f905dd079", "PETHNFTVault"], // bayc peth 2
+			["0xCb17D8aC8A5Ef576CD73729b22779e55bc686f43", "PETHNFTVault"], // bayc peth 3
+			["0x4d3F17C4dBF559c38d6Dd49942788B6c83eB7a74", "PETHNFTVault"],
+			["0x1f25109d1BE568b70cc159bC97f131cD493D58ee", "PETHNFTVault"],
+		]
+
+		const deployedAddresses: string[] = [
+			'0x7F897e1229E3a32Be2B33122C099AF29C99B8aB4',
+			'0xa50078695974EdD511a9103aB7FB8537D1d6556C',
+			'0x3b37b6Efb33193de79b0818F38f64186E92E3E1E',
+			'0x9465bf3c8cC049cD9Cdc9961BaC858093e829CBf',
+			'0x26DFfD5F3A62BC4D827A2C330e110A6C35CCBcd5',
+			'0x3A6C7E585C8B4Ae32b5EeB60C8620934f61fe397',
+			'0x9B3e61a9F6AC2F1b776fffd7f667f2dc5BE25d2b',
+			'0x2Af3C89f295FE40B7ac42fb24F29121513029bbE',
+			'0xa69269741946Df348A6f3e9d847B9749FfcE3abD',
+			'0x1ec60e07a33dF06688ef579C9b38f3c10a4f2Beb',
+			'0xe3336310A03F962A92eA4b2A1F85B3875180A679'
+		]
+		// for (let i = 0; i < proxies.length; i++) {
+		// 	try { 
+		// 		const [proxyAddress, contractName] = proxies[i]
+		// 		const NftVault = await ethers.getContractFactory(contractName);
+		// 		const nftVault = await NftVault.deploy()
+		// 		await nftVault.deployed()
+		// 		console.log("=====[deploy at]====== ", nftVault.address, " proxyAddress:", proxyAddress)
+
+		// 		await proxyAdmin.connect(deployer).upgrade(proxyAddress, nftVault.address);
+		// 		deployedAddresses.push(nftVault.address)
+		// 		// const vault = await ethers.getContractAt(contractName, proxyAddress, deployer);
+		// 		// await (await vault.grantRole("0x61c92169ef077349011ff0b1383c894d86c5f0b41d986366b58a6cf31e93beda", "0x531277aa28cd919b8386b4c2013ed7f4df3b8a21")).wait();
+		// 		// await (await vault.finalizeUpgrade()).wait()
+		// 		// await (await vault.grantRole("0x7a05a596cb0ce7fdea8a1e1ec73be300bdb35097c944ce1897202f7a13122eb2", "0xF9423E5cc3eE0956e7cB43BC7fffA9EA4C293F4d")).wait();
+		// 		console.log(i, "done")
+		// 	} catch(error) {
+		// 		console.log("error@upgrade-nftvault", error)
+		// 	}
+		// }
+		console.log({ deployedAddresses })
+		for (const nftVaultAddress of deployedAddresses) {
+			try {
+				if (network.name != "hardhat") {
+					console.log("Verifying NFTVault");
+					await run("verify:verify", {
+						address: nftVaultAddress,
+						constructorArguments: [],
+					});
+				}
+			}catch(e) {
+				console.error("error@verify", e)
+			}
+		}
+	})
+
