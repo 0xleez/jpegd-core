@@ -25,6 +25,7 @@ import "./deploy/14_deploy_JPEGDLPFarming";
 import "./deploy/15_transferOwnership";
 import "./deploy/16_deploy_Vault";
 import "./deploy/17_deploy_StrategyPUSDConvex";
+import "./deploy/18_deploy_ApeStake"
 
 dotenv.config();
 
@@ -38,11 +39,15 @@ module.exports = {
     hardhat: {
       forking: {
         url: "https://eth-mainnet.alchemyapi.io/v2/" + process.env.ALCHEMY_API_KEY,
-        blockNumber: 16435452
+        blockNumber: 16097722
       }
     },
     kovan: {
       url: "https://eth-kovan.alchemyapi.io/v2/" + process.env.ALCHEMY_API_KEY,
+      accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY] : [],
+    },
+    goerli: {
+      url: "https://eth-goerli.alchemyapi.io/v2/" + process.env.ALCHEMY_API_KEY,
       accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY] : [],
     },
     mainnet: {
