@@ -118,6 +118,114 @@ task("deploy-nftVault", "Deploys the NFTVault contract")
         console.log("All done.");
     });
 
+task("deploy-daoNftVault", "Deploys the NFTVault contract")
+    .addParam(
+        "vaultconfig",
+        "A JSON file containing the vault's configuration",
+        undefined,
+        types.inputFile
+    )
+    .addParam("collection", "The collection name", undefined, types.string)
+    .setAction(
+        async (
+            { collection, vaultconfig },
+            { network, ethers, run, upgrades }
+        ) => {
+            const configFilePath = path.join(
+                __dirname,
+                "config",
+                network.name + ".json"
+            );
+            const config = await JSON.parse(
+                fs.readFileSync(configFilePath).toString()
+            );
+
+            if (!config.pusd) throw "No PUSD address in network's config file";
+            if (!config.jpeg) throw "No JPEG address in network's config file";
+            if (!config.ethOracle)
+                throw "No ETHOracle address in network's config file";
+            if (!config.cigStaking)
+                throw "No JPEGCardsCigStaking address in network's config file";
+            if (!config.dao) throw "No DAO address in network's config file";
+
+            const vaultConfig = await JSON.parse(
+                fs.readFileSync(vaultconfig).toString()
+            );
+
+            if (!vaultConfig.nft) throw "No NFT in vault's config file";
+            if (!vaultConfig.floorOracle)
+                throw "No floor oracle in vault's config file";
+            if (!vaultConfig.debtInterestApr)
+                throw "No debt interest apr in vault's config file";
+            if (!vaultConfig.creditLimitRate)
+                throw "No credit limit rate in vault's config file";
+            if (!vaultConfig.liquidationLimitRate)
+                throw "No liquidation limit rate in vault's config file";
+            if (!vaultConfig.cigStakedCreditLimitRate)
+                throw "No cig staked credit limit rate in vault's config file";
+            if (!vaultConfig.cigStakedLiquidationLimitRate)
+                throw "No cig staked liquidation limit rate in vault's config file";
+            if (!vaultConfig.valueIncreaseLockRate)
+                throw "No value increase lock rate in vault's config file";
+            if (!vaultConfig.organizationFeeRate)
+                throw "No organization fee rate in vault's config file";
+            if (!vaultConfig.insurancePurchaseRate)
+                throw "No insurance purchase rate in vault's config file";
+            if (!vaultConfig.insuranceLiquidationPenaltyRate)
+                throw "No insurance liquidation penalty rate in vault's config file";
+            if (!vaultConfig.insuranceRepurchaseLimit)
+                throw "No insurance repurchase limit in vault's config file";
+            if (!vaultConfig.borrowAmountCap)
+                throw "No borrow amount cap in vault's config file";
+
+            const [deployer] = await ethers.getSigners();
+            console.log("Deployer: ", deployer.address);
+
+            const NFTVault = await ethers.getContractFactory("DAONFTVault");
+            const nftVault = await upgrades.deployProxy(NFTVault, [
+                config.peth,
+                vaultConfig.nft,
+                vaultConfig.nftValueProvider,
+                config.ethOracle, // pusd
+                [
+                    vaultConfig.debtInterestApr,
+                    vaultConfig.creditLimitRate,
+                    vaultConfig.organizationFeeRate,
+                    vaultConfig.borrowAmountCap
+                ]
+            ]);
+
+            console.log(
+                "NFTVault for ",
+                vaultConfig.nft,
+                " deployed at: ",
+                nftVault.address
+            );
+
+            config["daoPethVault-" + collection] = nftVault.address;
+            fs.writeFileSync(configFilePath, JSON.stringify(config));
+
+            console.log("Setting up NFTVault");
+
+            await (await nftVault.grantRole(DAO_ROLE, config.dao)).wait();
+
+            if (network.name != "hardhat") {
+                console.log("Verifying NFTVault");
+
+                const nftVaultImplementation = await (
+                    await upgrades.admin.getInstance()
+                ).getProxyImplementation(nftVault.address);
+
+                await run("verify:verify", {
+                    address: nftVaultImplementation.address,
+                    constructorArguments: []
+                });
+            }
+
+            console.log("All done.");
+        }
+    );
+
 task("deploy-nftVaultImpl", "Upgrades the NFTVault contract").setAction(
     async ({}, { network, ethers, run, upgrades }) => {
         const [deployer] = await ethers.getSigners();
@@ -170,13 +278,13 @@ task(
 });
 
 task("deploy-nftprovider", "Deploys the NFTValueProvider contract")
-    .addParam(
-        "vaultconfig",
-        "A JSON file containing the vault's configuration",
-        undefined,
-        types.inputFile
-    )
-    .addParam("collection", "The collection name", undefined, types.string)
+    // .addParam(
+    //     "vaultconfig",
+    //     "A JSON file containing the vault's configuration",
+    //     undefined,
+    //     types.inputFile
+    // )
+    // .addParam("collection", "The collection name", undefined, types.string)
     .setAction(
         async (
             { vaultconfig, collection },
@@ -191,46 +299,42 @@ task("deploy-nftprovider", "Deploys the NFTValueProvider contract")
                 fs.readFileSync(configFilePath).toString()
             );
 
-            if (!config.jpeg) throw "No jpeg address in network's config file";
+            // if (!config.jpeg) throw "No jpeg address in network's config file";
 
-            const vaultConfig = await JSON.parse(
-                fs.readFileSync(vaultconfig).toString()
-            );
-            if (!vaultConfig.jpegOraclesAggregator)
-                throw "No jpegOraclesAggregator address in network's config file";
-            if (!vaultConfig.valueIncreaseLockRate)
-                throw "No valueIncreaseLockRate field in network's config file";
+            // const vaultConfig = await JSON.parse(
+            //     fs.readFileSync(vaultconfig).toString()
+            // );
+            // if (!vaultConfig.jpegOraclesAggregator)
+            //     throw "No jpegOraclesAggregator address in network's config file";
+            // if (!vaultConfig.valueIncreaseLockRate)
+            //     throw "No valueIncreaseLockRate field in network's config file";
 
             const [deployer] = await ethers.getSigners();
             console.log("Deployer: ", deployer.address);
 
-            const NFTValueProvider = await ethers.getContractFactory(
-                "NFTValueProvider"
+            const BAKCApeStakingStrategy = await ethers.getContractFactory(
+                "BAKCApeStakingStrategy"
             );
-            const nftValueprovider = await upgrades.deployProxy(
-                NFTValueProvider,
-                [
-                    config.jpeg,
-                    vaultConfig.jpegOraclesAggregator,
-                    config.cigStaking,
-                    vaultConfig.creditLimitRate,
-                    vaultConfig.liquidationLimitRate,
-                    vaultConfig.cigStakedCreditLimitRate,
-                    vaultConfig.jpegLockedMaxRateIncrease,
-                    vaultConfig.ltvBoostLockRate,
-                    vaultConfig.traitBoostLockRate,
-                    "0"
-                ]
+            const bakcStrategy = await upgrades.deployProxy(
+                BAKCApeStakingStrategy,
+                [],
+                {
+                    constructorArgs: [
+                        "0x0AF969385fDD6dfD620c3E8bD2ff12Aa20288407",
+                        config.ape,
+                        config.apeStaking
+                    ]
+                }
             );
-            console.log("deployed at: ", nftValueprovider.address);
+            console.log("deployed at: ", bakcStrategy.address);
 
-            config["nftValueProvider-" + collection] = nftValueprovider.address;
-            fs.writeFileSync(configFilePath, JSON.stringify(config));
+            // config["nftValueProvider-" + collection] = nftValueprovider.address;
+            // fs.writeFileSync(configFilePath, JSON.stringify(config));
 
             if (network.name != "hardhat") {
                 console.log("Verifying oracle");
                 await run("verify:verify", {
-                    address: nftValueprovider.address,
+                    address: bakcStrategy.address,
                     constructorArguments: []
                 });
             }
@@ -239,13 +343,15 @@ task("deploy-nftprovider", "Deploys the NFTValueProvider contract")
 
 task("deploy-providerImpl", "Deploy NFTValueProvider impl").setAction(
     async ({}, { network, ethers, run, upgrades }) => {
-        const Provider = await ethers.getContractFactory("NFTValueProvider");
+        const Provider = await ethers.getContractFactory(
+            "BAYCApeStakingStrategy"
+        );
         const provider = await Provider.deploy();
         console.log("deploy at: ", provider.address);
         await provider.deployed();
 
         if (network.name != "hardhat") {
-            console.log("Verifying NFTVault");
+            console.log("Verifying");
             await run("verify:verify", {
                 address: provider.address,
                 constructorArguments: []
