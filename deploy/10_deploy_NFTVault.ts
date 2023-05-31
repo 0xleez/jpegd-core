@@ -525,3 +525,34 @@ task("update-providerImpl", "Upgrades the NFTVault contract").setAction(
         }
     }
 );
+
+task("provider-upgrade", "Upgrades the NFTVault contract").setAction(
+    async ({}, hre) => {
+        const { network, ethers, run, upgrades } = hre;
+        const [deployer] = await ethers.getSigners();
+        console.log("Deployer: ", deployer.address);
+
+        const proxies = [
+            "0x51CAA94e52b48849e2314d8959eB416E646aa65D", // punks
+            "0xb145723aEDE3e847Cb2C7B78BF55eD3bF963673e", // rocks
+            "0xd419bf430A446185497331A8364Ef054166caa84", // bayc
+            "0x460cA887a7a85fB06c3AcCC660FcA7A39B537Cbb", // mayc
+            "0x57b4ea41947a289A83482f8F26CEE4A290BBB5BB" // fidenza
+        ];
+
+        const providerAddress = "0xb145723aEDE3e847Cb2C7B78BF55eD3bF963673e";
+        const creditCap = [60, 100];
+        const liqCap = [61, 100];
+        const releaseDelay = 3600 * 24 * 2;
+
+        const nftValueProvider = await ethers.getContractAt(
+            "NFTValueProvider",
+            providerAddress
+        );
+        await (
+            await nftValueProvider
+                .connect(deployer)
+                .finalizeUpgrade(creditCap, liqCap, releaseDelay)
+        ).wait();
+    }
+);
