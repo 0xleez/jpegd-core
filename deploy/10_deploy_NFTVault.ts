@@ -343,9 +343,7 @@ task("deploy-nftprovider", "Deploys the NFTValueProvider contract")
 
 task("deploy-providerImpl", "Deploy NFTValueProvider impl").setAction(
     async ({}, { network, ethers, run, upgrades }) => {
-        const Provider = await ethers.getContractFactory(
-            "BAYCApeStakingStrategy"
-        );
+        const Provider = await ethers.getContractFactory("NFTValueProvider");
         const provider = await Provider.deploy();
         console.log("deploy at: ", provider.address);
         await provider.deployed();
