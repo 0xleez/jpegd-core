@@ -484,43 +484,39 @@ task("update-providerImpl", "Upgrades the NFTVault contract").setAction(
             "0x51CAA94e52b48849e2314d8959eB416E646aa65D", // punks
             "0xb145723aEDE3e847Cb2C7B78BF55eD3bF963673e", // rocks
             "0xd419bf430A446185497331A8364Ef054166caa84", // bayc
-            "0x460cA887a7a85fB06c3AcCC660FcA7A39B537Cbb" // mayc
+            "0x460cA887a7a85fB06c3AcCC660FcA7A39B537Cbb", // mayc
+            "0x7D68711F0f771C0A60E9d6c6B105efeaBABee903", // bakc
+            "0x57b4ea41947a289A83482f8F26CEE4A290BBB5BB" // fidenza
         ];
-
-        const deployedAddresses: string[] = [];
 
         const NFTValueProvider = await ethers.getContractFactory(
             "NFTValueProvider"
         );
         const nFTValueProvider = await NFTValueProvider.deploy();
         await nFTValueProvider.deployed();
-        deployedAddresses.push(nFTValueProvider.address);
         console.log("=====[deploy at]====== ", nFTValueProvider.address);
+        try {
+            if (network.name != "hardhat") {
+                console.log("Verifying nFTValueProvider");
+                await run("verify:verify", {
+                    address: nFTValueProvider.address,
+                    constructorArguments: []
+                });
+            }
+        } catch (e) {
+            console.log("e@error", e);
+        }
 
+        const providerAddress = nFTValueProvider.address;
         for (let i = 0; i < proxies.length; i++) {
             try {
                 const proxyAddress = proxies[i];
                 await proxyAdmin
                     .connect(deployer)
-                    .upgrade(proxyAddress, nFTValueProvider.address);
+                    .upgrade(proxyAddress, providerAddress);
                 console.log(i, "done");
             } catch (error) {
-                console.log("error@upgrade-nftvault", error);
-            }
-        }
-
-        console.log({ deployedAddresses });
-        for (const nftVaultAddress of deployedAddresses) {
-            try {
-                if (network.name != "hardhat") {
-                    console.log("Verifying NFTVault");
-                    await run("verify:verify", {
-                        address: nftVaultAddress,
-                        constructorArguments: []
-                    });
-                }
-            } catch (e) {
-                console.error("error@verify", e);
+                console.log("error@upgrade-nftvault", i, error);
             }
         }
     }
