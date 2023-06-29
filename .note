@@ -1,0 +1,7 @@
+New Vault
+1. deploy provider
+2. whitelist provider in aggregator
+3. deploy vaults
+4. grant vaults minter role on peth/pusd
+5. whitelist vaults in router
+6. grant router role in vaults
