@@ -1,6 +1,6 @@
 import { SignerWithAddress } from "@nomiclabs/hardhat-ethers/signers";
-import chai from "chai";
-import { solidity } from "ethereum-waffle";
+import { expect } from "chai";
+import { BigNumber, BigNumberish } from "ethers";
 import { ethers, upgrades } from "hardhat";
 import {
     JPEG,
@@ -9,11 +9,14 @@ import {
     TestERC721,
     UniswapV2MockOracle
 } from "../types";
-import { units, bn, timeTravel } from "./utils";
-
-const { expect } = chai;
-
-chai.use(solidity);
+import {
+    units,
+    bn,
+    timeTravel,
+    setNextTimestamp,
+    currentTimestamp,
+    ZERO_ADDRESS
+} from "./utils";
 
 const apeHash =
     "0x26bca2ecad19e981c90a8c6efd8ee9856bbc5a2042259e6ee31e310fdc08d970";
@@ -21,6 +24,26 @@ const minterRole =
     "0x9f2df0fed2c77648de5860a4cc508cd0818c85b8b8a1ab4ceeef8d981c8956a6";
 const zeroHash =
     "0x0000000000000000000000000000000000000000000000000000000000000000";
+
+const baseCreditLimitRate = [60, 100];
+const baseLiquidationLimitRate = [70, 100];
+const cigBoostRateIncrease = [10, 100];
+const ltvBoostMaxRateIncrease = [2000, 10000];
+const traitBoostLockRate = [35, 100];
+const ltvBoostLockRate = [2_000, 10_000];
+const ltvRateCap = [80, 100];
+const liquidationRateCap = [81, 100];
+const locksReleaseDelay = 7 * 86400;
+
+const jpegPrice = bn("1000000000000000");
+const floor = units(50);
+
+function sumRates(r1: BigNumberish[], ...remaining: BigNumberish[][]) {
+    return remaining.reduce<BigNumber[]>(
+        (p, c) => [p[0].mul(c[1]).add(p[1].mul(c[0])), p[1].mul(c[1])],
+        [bn(r1[0]), bn(r1[1])]
+    );
+}
 
 describe("NFTValueProvider", () => {
 	let owner: SignerWithAddress,
