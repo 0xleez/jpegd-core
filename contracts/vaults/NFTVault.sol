@@ -13,6 +13,8 @@ import "../interfaces/INFTValueProvider.sol";
 import "../interfaces/IStandardNFTStrategy.sol";
 import "../interfaces/IFlashNFTStrategy.sol";
 
+import "../utils/RateLib.sol";
+
 /// @title NFT lending vault
 /// @notice This contracts allows users to borrow PUSD using NFTs as collateral.
 /// The floor price of the NFT collection is fetched using a chainlink oracle, while some other more valuable traits
@@ -24,9 +26,9 @@ contract NFTVault is AccessControlUpgradeable, ReentrancyGuardUpgradeable {
     using SafeERC20Upgradeable for IStableCoin;
     using EnumerableSetUpgradeable for EnumerableSetUpgradeable.UintSet;
     using EnumerableSetUpgradeable for EnumerableSetUpgradeable.AddressSet;
+    using RateLib for RateLib.Rate;
 
     error InvalidNFT(uint256 nftIndex);
-    error InvalidRate(Rate rate);
     error InvalidNFTType(bytes32 nftType);
     error InvalidUnlockTime(uint256 unlockTime);
     error InvalidAmount(uint256 amount);
@@ -73,8 +75,18 @@ contract NFTVault is AccessControlUpgradeable, ReentrancyGuardUpgradeable {
     );
     event Repurchased(address indexed owner, uint256 indexed index);
     event InsuranceExpired(address indexed owner, uint256 indexed index);
-    event StrategyDeposit(uint256 indexed nftIndex, address indexed strategy, bool isStandard);
-    event StrategyWithdrawal(uint256 indexed nftIndex, address indexed strategy);
+    event StrategyDeposit(
+        uint256 indexed nftIndex,
+        address indexed strategy,
+        bool isStandard
+    );
+    event StrategyWithdrawal(
+        uint256 indexed nftIndex,
+        address indexed strategy
+    );
+
+    event Accrual(uint256 additionalInterest);
+    event FeeCollected(uint256 collectedAmount);
 
     enum BorrowType {
         NOT_CONFIRMED,
@@ -92,11 +104,6 @@ contract NFTVault is AccessControlUpgradeable, ReentrancyGuardUpgradeable {
         IStandardNFTStrategy strategy;
     }
 
-    struct Rate {
-        uint128 numerator;
-        uint128 denominator;
-    }
-
     /// @custom:oz-renamed-from JPEGLock
     struct Unused13 {
         address owner;
@@ -105,20 +112,20 @@ contract NFTVault is AccessControlUpgradeable, ReentrancyGuardUpgradeable {
     }
 
     struct VaultSettings {
-        Rate debtInterestApr;
+        RateLib.Rate debtInterestApr;
         /// @custom:oz-renamed-from creditLimitRate
-        Rate unused15;
+        RateLib.Rate unused15;
         /// @custom:oz-renamed-from liquidationLimitRate
-        Rate unused16;
+        RateLib.Rate unused16;
         /// @custom:oz-renamed-from cigStakedCreditLimitRate
-        Rate unused17;
+        RateLib.Rate unused17;
         /// @custom:oz-renamed-from cigStakedLiquidationLimitRate
-        Rate unused18;
+        RateLib.Rate unused18;
         /// @custom:oz-renamed-from valueIncreaseLockRate
-        Rate unused12;
-        Rate organizationFeeRate;
-        Rate insurancePurchaseRate;
-        Rate insuranceLiquidationPenaltyRate;
+        RateLib.Rate unused12;
+        RateLib.Rate organizationFeeRate;
+        RateLib.Rate insurancePurchaseRate;
+        RateLib.Rate insuranceLiquidationPenaltyRate;
         uint256 insuranceRepurchaseTimeLimit;
         uint256 borrowAmountCap;
     }
@@ -157,6 +164,7 @@ contract NFTVault is AccessControlUpgradeable, ReentrancyGuardUpgradeable {
     address private unused3; //Unused after upgrade
     /// @custom:oz-renamed-from cigStaking
     address private unused14;
+
     IERC721Upgradeable public nftContract;
 
     /// @custom:oz-renamed-from daoFloorOverride
@@ -189,20 +197,11 @@ contract NFTVault is AccessControlUpgradeable, ReentrancyGuardUpgradeable {
     /// @custom:oz-renamed-from minJPEGToLock
     uint256 private unused6;
     /// @custom:oz-renamed-from nftTypeValueMultiplier
-    mapping(bytes32 => Rate) private unused7;
+    mapping(bytes32 => RateLib.Rate) private unused7;
     /// @custom:oz-renamed-from lockPositions
     mapping(uint256 => Unused13) private unused13;
 
     EnumerableSetUpgradeable.AddressSet private nftStrategies;
-
-    /// @dev Checks if the provided NFT index is valid
-    /// @param nftIndex The index to check
-    modifier validNFTIndex(uint256 nftIndex) {
-        //The standard OZ ERC721 implementation of ownerOf reverts on a non existing nft isntead of returning address(0)
-        if (nftContract.ownerOf(nftIndex) == address(0))
-            revert InvalidNFT(nftIndex);
-        _;
-    }
 
     /// @notice This function is only called once during deployment of the proxy contract. It's not called after upgrades.
     /// @param _stablecoin PUSD address
@@ -226,10 +225,25 @@ contract NFTVault is AccessControlUpgradeable, ReentrancyGuardUpgradeable {
         _setRoleAdmin(ROUTER_ROLE, DAO_ROLE);
         _setRoleAdmin(DAO_ROLE, DAO_ROLE);
 
-        _validateRateBelowOne(_settings.debtInterestApr);
-        _validateRateBelowOne(_settings.organizationFeeRate);
-        _validateRateBelowOne(_settings.insurancePurchaseRate);
-        _validateRateBelowOne(_settings.insuranceLiquidationPenaltyRate);
+        if (
+            !_settings.debtInterestApr.isValid() ||
+            !_settings.debtInterestApr.isBelowOne()
+        ) revert RateLib.InvalidRate();
+
+        if (
+            !_settings.organizationFeeRate.isValid() ||
+            !_settings.organizationFeeRate.isBelowOne()
+        ) revert RateLib.InvalidRate();
+
+        if (
+            !_settings.insurancePurchaseRate.isValid() ||
+            !_settings.insurancePurchaseRate.isBelowOne()
+        ) revert RateLib.InvalidRate();
+
+        if (
+            !_settings.insuranceLiquidationPenaltyRate.isValid() ||
+            !_settings.insuranceLiquidationPenaltyRate.isBelowOne()
+        ) revert RateLib.InvalidRate();
 
         stablecoin = _stablecoin;
         ethAggregator = _ethAggregator;
@@ -242,10 +256,7 @@ contract NFTVault is AccessControlUpgradeable, ReentrancyGuardUpgradeable {
     /// @dev Function called by the {ProxyAdmin} contract during the upgrade process.
     /// Only called on existing vaults where the `initialize` function has already been called.
     /// It won't be called in new deployments.
-    function finalizeUpgrade()
-        external
-        onlyRole(SETTER_ROLE)
-    {
+    function finalizeUpgrade() external onlyRole(SETTER_ROLE) {
         _setRoleAdmin(ROUTER_ROLE, DAO_ROLE);
     }
 
@@ -263,17 +274,19 @@ contract NFTVault is AccessControlUpgradeable, ReentrancyGuardUpgradeable {
 
     /// @param _nftIndex The NFT to return the credit limit of
     /// @return The PUSD credit limit of the NFT at index `_nftIndex`.
-    function getCreditLimit(address _owner, uint256 _nftIndex) external view returns (uint256) {
+    function getCreditLimit(
+        address _owner,
+        uint256 _nftIndex
+    ) external view returns (uint256) {
         return _getCreditLimit(_owner, _nftIndex);
     }
 
     /// @param _nftIndex The NFT to return the liquidation limit of
     /// @return The PUSD liquidation limit of the NFT at index `_nftIndex`.
-    function getLiquidationLimit(address _owner, uint256 _nftIndex)
-        public
-        view
-        returns (uint256)
-    {
+    function getLiquidationLimit(
+        address _owner,
+        uint256 _nftIndex
+    ) public view returns (uint256) {
         return _getLiquidationLimit(_owner, _nftIndex);
     }
 
@@ -333,6 +346,8 @@ contract NFTVault is AccessControlUpgradeable, ReentrancyGuardUpgradeable {
 
         totalDebtAmount += additionalInterest;
         totalFeeCollected += additionalInterest;
+
+        emit Accrual(additionalInterest);
     }
 
     /// @notice Like {doActions} but executed with the specified `_account`.
@@ -348,10 +363,10 @@ contract NFTVault is AccessControlUpgradeable, ReentrancyGuardUpgradeable {
     /// @notice Allows to execute multiple actions in a single transaction.
     /// @param _actions The actions to execute.
     /// @param _data The abi encoded parameters for the actions to execute.
-    function doActions(uint8[] calldata _actions, bytes[] calldata _data)
-        external
-        nonReentrant
-    {
+    function doActions(
+        uint8[] calldata _actions,
+        bytes[] calldata _data
+    ) external nonReentrant {
         _doActionsFor(msg.sender, _actions, _data);
     }
 
@@ -373,6 +388,8 @@ contract NFTVault is AccessControlUpgradeable, ReentrancyGuardUpgradeable {
         bool _insurance,
         address _strategy
     ) external nonReentrant onlyRole(ROUTER_ROLE) {
+        _validNFTIndex(_nftIndex);
+
         accrue();
 
         if (positionOwner[_nftIndex] != address(0)) revert Unauthorized();
@@ -389,8 +406,12 @@ contract NFTVault is AccessControlUpgradeable, ReentrancyGuardUpgradeable {
         if (_strategy != address(0)) {
             if (
                 !nftStrategies.contains(_strategy) ||
-                IGenericNFTStrategy(_strategy).kind() != IGenericNFTStrategy.Kind.STANDARD ||
-                !IStandardNFTStrategy(_strategy).isDeposited(_account, _nftIndex)
+                IGenericNFTStrategy(_strategy).kind() !=
+                IGenericNFTStrategy.Kind.STANDARD ||
+                !IStandardNFTStrategy(_strategy).isDeposited(
+                    _account,
+                    _nftIndex
+                )
             ) revert InvalidStrategy();
 
             position.strategy = IStandardNFTStrategy(_strategy);
@@ -438,6 +459,8 @@ contract NFTVault is AccessControlUpgradeable, ReentrancyGuardUpgradeable {
         uint256 _nftIndex,
         address _recipient
     ) external nonReentrant onlyRole(ROUTER_ROLE) returns (uint256) {
+        _validNFTIndex(_nftIndex);
+
         accrue();
 
         if (_account != positionOwner[_nftIndex]) revert Unauthorized();
@@ -512,10 +535,10 @@ contract NFTVault is AccessControlUpgradeable, ReentrancyGuardUpgradeable {
     /// @dev Emits a {Liquidated} event
     /// @param _nftIndex The NFT to liquidate
     /// @param _recipient The address to send the NFT to
-    function liquidate(uint256 _nftIndex, address _recipient)
-        external
-        nonReentrant
-    {
+    function liquidate(
+        uint256 _nftIndex,
+        address _recipient
+    ) external nonReentrant {
         accrue();
         _liquidate(msg.sender, _nftIndex, _recipient);
     }
@@ -534,10 +557,10 @@ contract NFTVault is AccessControlUpgradeable, ReentrancyGuardUpgradeable {
     /// @dev Emits an {InsuranceExpired} event
     /// @param _nftIndex The NFT to claim
     /// @param _recipient The address to send the NFT to
-    function claimExpiredInsuranceNFT(uint256 _nftIndex, address _recipient)
-        external
-        nonReentrant
-    {
+    function claimExpiredInsuranceNFT(
+        uint256 _nftIndex,
+        address _recipient
+    ) external nonReentrant {
         _claimExpiredInsuranceNFT(msg.sender, _nftIndex, _recipient);
     }
 
@@ -551,16 +574,20 @@ contract NFTVault is AccessControlUpgradeable, ReentrancyGuardUpgradeable {
         uint256 _strategyIndex,
         bytes calldata _additionalData
     ) external nonReentrant {
-        _depositInStrategy(msg.sender, _nftIndexes, _strategyIndex, _additionalData);
+        _depositInStrategy(
+            msg.sender,
+            _nftIndexes,
+            _strategyIndex,
+            _additionalData
+        );
     }
 
     /// @notice Allows users to withdraw NFTs from strategies
     /// @dev Emits multiple {StrategyWithdrawal} events
     /// @param _nftIndexes The indexes of the NFTs to withdraw
-    function withdrawFromStrategy(uint256[] calldata _nftIndexes)
-        external
-        nonReentrant
-    {
+    function withdrawFromStrategy(
+        uint256[] calldata _nftIndexes
+    ) external nonReentrant {
         _withdrawFromStrategy(msg.sender, _nftIndexes);
     }
 
@@ -592,16 +619,20 @@ contract NFTVault is AccessControlUpgradeable, ReentrancyGuardUpgradeable {
     /// @notice Allows the DAO to collect interest and fees before they are repaid
     function collect() external nonReentrant onlyRole(DAO_ROLE) {
         accrue();
-        stablecoin.mint(msg.sender, totalFeeCollected);
+
+        uint256 _totalFeeCollected = totalFeeCollected;
+
+        stablecoin.mint(msg.sender, _totalFeeCollected);
         totalFeeCollected = 0;
+
+        emit FeeCollected(_totalFeeCollected);
     }
 
     /// @notice Allows the DAO to withdraw _amount of an ERC20
-    function rescueToken(IERC20Upgradeable _token, uint256 _amount)
-        external
-        nonReentrant
-        onlyRole(DAO_ROLE)
-    {
+    function rescueToken(
+        IERC20Upgradeable _token,
+        uint256 _amount
+    ) external nonReentrant onlyRole(DAO_ROLE) {
         _token.safeTransfer(msg.sender, _amount);
     }
 
@@ -622,10 +653,9 @@ contract NFTVault is AccessControlUpgradeable, ReentrancyGuardUpgradeable {
     /// @notice Allows the setter contract to change fields in the `VaultSettings` struct.
     /// @dev Validation and single field setting is handled by an external contract with the
     /// `SETTER_ROLE`. This was done to reduce the contract's size.
-    function setSettings(VaultSettings calldata _settings)
-        external
-        onlyRole(SETTER_ROLE)
-    {
+    function setSettings(
+        VaultSettings calldata _settings
+    ) external onlyRole(SETTER_ROLE) {
         settings = _settings;
     }
 
@@ -728,15 +758,15 @@ contract NFTVault is AccessControlUpgradeable, ReentrancyGuardUpgradeable {
         }
     }
 
-    
-
     /// @dev See {borrow}
     function _borrow(
         address _account,
         uint256 _nftIndex,
         uint256 _amount,
         bool _useInsurance
-    ) internal validNFTIndex(_nftIndex) {
+    ) internal {
+        _validNFTIndex(_nftIndex);
+
         address owner = positionOwner[_nftIndex];
         if (owner != _account && owner != address(0)) revert Unauthorized();
 
@@ -803,7 +833,9 @@ contract NFTVault is AccessControlUpgradeable, ReentrancyGuardUpgradeable {
         address _account,
         uint256 _nftIndex,
         uint256 _amount
-    ) internal validNFTIndex(_nftIndex) {
+    ) internal {
+        _validNFTIndex(_nftIndex);
+
         if (_account != positionOwner[_nftIndex]) revert Unauthorized();
 
         if (_amount == 0) revert InvalidAmount(_amount);
@@ -843,10 +875,9 @@ contract NFTVault is AccessControlUpgradeable, ReentrancyGuardUpgradeable {
     }
 
     /// @dev See {closePosition}
-    function _closePosition(address _account, uint256 _nftIndex)
-        internal
-        validNFTIndex(_nftIndex)
-    {
+    function _closePosition(address _account, uint256 _nftIndex) internal {
+        _validNFTIndex(_nftIndex);
+
         if (_account != positionOwner[_nftIndex]) revert Unauthorized();
 
         Position storage position = positions[_nftIndex];
@@ -872,8 +903,10 @@ contract NFTVault is AccessControlUpgradeable, ReentrancyGuardUpgradeable {
         address _account,
         uint256 _nftIndex,
         address _recipient
-    ) internal validNFTIndex(_nftIndex) {
+    ) internal {
         _checkRole(LIQUIDATOR_ROLE, _account);
+        _validNFTIndex(_nftIndex);
+
         address posOwner = positionOwner[_nftIndex];
         if (posOwner == address(0)) revert InvalidPosition(_nftIndex);
 
@@ -917,10 +950,9 @@ contract NFTVault is AccessControlUpgradeable, ReentrancyGuardUpgradeable {
     }
 
     /// @dev See {repurchase}
-    function _repurchase(address _account, uint256 _nftIndex)
-        internal
-        validNFTIndex(_nftIndex)
-    {
+    function _repurchase(address _account, uint256 _nftIndex) internal {
+        _validNFTIndex(_nftIndex);
+
         Position memory position = positions[_nftIndex];
         if (_account != positionOwner[_nftIndex]) revert Unauthorized();
         if (position.liquidatedAt == 0) revert InvalidPosition(_nftIndex);
@@ -958,7 +990,9 @@ contract NFTVault is AccessControlUpgradeable, ReentrancyGuardUpgradeable {
         address _account,
         uint256 _nftIndex,
         address _recipient
-    ) internal validNFTIndex(_nftIndex) {
+    ) internal {
+        _validNFTIndex(_nftIndex);
+
         if (_recipient == address(0)) revert ZeroAddress();
         Position memory position = positions[_nftIndex];
         address owner = positionOwner[_nftIndex];
@@ -995,7 +1029,9 @@ contract NFTVault is AccessControlUpgradeable, ReentrancyGuardUpgradeable {
         IERC721Upgradeable nft = nftContract;
         bool isStandard = IGenericNFTStrategy(strategy).kind() ==
             IGenericNFTStrategy.Kind.STANDARD;
-        address depositAddress = IGenericNFTStrategy(strategy).depositAddress(_owner);
+        address depositAddress = IGenericNFTStrategy(strategy).depositAddress(
+            _owner
+        );
         for (uint256 i; i < length; ++i) {
             uint256 index = _nftIndexes[i];
 
@@ -1007,16 +1043,26 @@ contract NFTVault is AccessControlUpgradeable, ReentrancyGuardUpgradeable {
             if (address(position.strategy) != address(0))
                 revert InvalidPosition(index);
 
-            if (isStandard) position.strategy = IStandardNFTStrategy(address(strategy));
+            if (isStandard)
+                position.strategy = IStandardNFTStrategy(address(strategy));
             nft.transferFrom(address(this), depositAddress, index);
 
             emit StrategyDeposit(index, address(strategy), isStandard);
         }
 
         if (isStandard)
-            IStandardNFTStrategy(strategy).afterDeposit(_owner, _nftIndexes, _additionalData);
+            IStandardNFTStrategy(strategy).afterDeposit(
+                _owner,
+                _nftIndexes,
+                _additionalData
+            );
         else {
-            IFlashNFTStrategy(strategy).afterDeposit(_owner, address(this), _nftIndexes, _additionalData);
+            IFlashNFTStrategy(strategy).afterDeposit(
+                _owner,
+                address(this),
+                _nftIndexes,
+                _additionalData
+            );
             for (uint256 i; i < length; ++i) {
                 if (nft.ownerOf(_nftIndexes[i]) != address(this))
                     revert InvalidStrategy();
@@ -1025,7 +1071,10 @@ contract NFTVault is AccessControlUpgradeable, ReentrancyGuardUpgradeable {
     }
 
     /// @dev See {withdrawFromStrategy}
-    function _withdrawFromStrategy(address _owner, uint256[] memory _nftIndexes) internal {
+    function _withdrawFromStrategy(
+        address _owner,
+        uint256[] memory _nftIndexes
+    ) internal {
         uint256 length = _nftIndexes.length;
         if (length == 0) revert InvalidLength();
 
@@ -1069,9 +1118,7 @@ contract NFTVault is AccessControlUpgradeable, ReentrancyGuardUpgradeable {
         if (_flashStrategy.kind() != IGenericNFTStrategy.Kind.FLASH)
             revert InvalidStrategy();
 
-        address _flashDepositAddress = _flashStrategy.depositAddress(
-            _owner
-        );
+        address _flashDepositAddress = _flashStrategy.depositAddress(_owner);
 
         IStandardNFTStrategy _sourceStrategy = IStandardNFTStrategy(
             nftStrategies.at(_sourceStrategyIndex)
@@ -1110,23 +1157,26 @@ contract NFTVault is AccessControlUpgradeable, ReentrancyGuardUpgradeable {
                 revert InvalidStrategy();
         }
 
-        _sourceStrategy.flashLoanEnd(
-            _owner,
-            _nftIndexes,
-            _sourceStrategyData
-        );
+        _sourceStrategy.flashLoanEnd(_owner, _nftIndexes, _sourceStrategyData);
+    }
+
+    function _validNFTIndex(uint256 _nftIndex) internal view {
+        if (nftContract.ownerOf(_nftIndex) == address(0))
+            revert InvalidNFT(_nftIndex);
     }
 
     /// @dev Returns the credit limit of an NFT
     /// @param _owner The owner of the NFT
     /// @param _nftIndex The NFT to return credit limit of
     /// @return The NFT credit limit
-    function _getCreditLimit(address _owner, uint256 _nftIndex)
-        internal
-        view
-        returns (uint256)
-    {
-        uint256 creditLimitETH = nftValueProvider.getCreditLimitETH(_owner, _nftIndex);
+    function _getCreditLimit(
+        address _owner,
+        uint256 _nftIndex
+    ) internal view returns (uint256) {
+        uint256 creditLimitETH = nftValueProvider.getCreditLimitETH(
+            _owner,
+            _nftIndex
+        );
         return _ethToUSD(creditLimitETH);
     }
 
@@ -1134,12 +1184,14 @@ contract NFTVault is AccessControlUpgradeable, ReentrancyGuardUpgradeable {
     /// @param _owner The owner of the NFT
     /// @param _nftIndex The index of the NFT
     /// @return The minimum amount of debt to liquidate the NFT
-    function _getLiquidationLimit(address _owner, uint256 _nftIndex)
-        internal
-        view
-        returns (uint256)
-    {
-        uint256 liquidationLimitETH = nftValueProvider.getLiquidationLimitETH(_owner, _nftIndex);
+    function _getLiquidationLimit(
+        address _owner,
+        uint256 _nftIndex
+    ) internal view returns (uint256) {
+        uint256 liquidationLimitETH = nftValueProvider.getLiquidationLimitETH(
+            _owner,
+            _nftIndex
+        );
         return _ethToUSD(liquidationLimitETH);
     }
 
@@ -1198,17 +1250,16 @@ contract NFTVault is AccessControlUpgradeable, ReentrancyGuardUpgradeable {
 
     /// @dev Converts an ETH value in USD
     function _ethToUSD(uint256 _ethValue) internal view returns (uint256) {
-        return (_ethValue * _normalizeAggregatorAnswer(ethAggregator)) / 1 ether;
+        return
+            (_ethValue * _normalizeAggregatorAnswer(ethAggregator)) / 1 ether;
     }
 
     /// @dev Fetches and converts to 18 decimals precision the latest answer of a Chainlink aggregator
     /// @param aggregator The aggregator to fetch the answer from
     /// @return The latest aggregator answer, normalized
-    function _normalizeAggregatorAnswer(IAggregatorV3Interface aggregator)
-        internal
-        view
-        returns (uint256)
-    {
+    function _normalizeAggregatorAnswer(
+        IAggregatorV3Interface aggregator
+    ) internal view returns (uint256) {
         (, int256 answer, , uint256 timestamp, ) = aggregator.latestRoundData();
 
         if (answer == 0 || timestamp == 0) revert InvalidOracleResults();
@@ -1219,15 +1270,8 @@ contract NFTVault is AccessControlUpgradeable, ReentrancyGuardUpgradeable {
             //converts the answer to have 18 decimals
             return
                 decimals > 18
-                    ? uint256(answer) / 10**(decimals - 18)
-                    : uint256(answer) * 10**(18 - decimals);
+                    ? uint256(answer) / 10 ** (decimals - 18)
+                    : uint256(answer) * 10 ** (18 - decimals);
         }
-    }
-
-    /// @dev Validates a rate. The denominator must be greater than zero and greater than or equal to the numerator.
-    /// @param _rate The rate to validate
-    function _validateRateBelowOne(Rate memory _rate) internal pure {
-        if (_rate.denominator == 0 || _rate.denominator < _rate.numerator)
-            revert InvalidRate(_rate);
     }
 }

@@ -3,25 +3,24 @@ import chai from "chai";
 import { solidity } from "ethereum-waffle";
 import { ethers, upgrades } from "hardhat";
 import {
-	JPEG,
-	JPEGCardsCigStaking,
-	NFTValueProvider,
-	TestERC721,
-	UniswapV2MockOracle
+    JPEG,
+    JPEGCardsCigStaking,
+    NFTValueProvider,
+    TestERC721,
+    UniswapV2MockOracle
 } from "../types";
-import {
-	units,
-	bn,
-	timeTravel
-} from "./utils";
+import { units, bn, timeTravel } from "./utils";
 
 const { expect } = chai;
 
 chai.use(solidity);
 
-const apeHash = "0x26bca2ecad19e981c90a8c6efd8ee9856bbc5a2042259e6ee31e310fdc08d970";
-const minterRole = "0x9f2df0fed2c77648de5860a4cc508cd0818c85b8b8a1ab4ceeef8d981c8956a6";
-const zeroHash = "0x0000000000000000000000000000000000000000000000000000000000000000";
+const apeHash =
+    "0x26bca2ecad19e981c90a8c6efd8ee9856bbc5a2042259e6ee31e310fdc08d970";
+const minterRole =
+    "0x9f2df0fed2c77648de5860a4cc508cd0818c85b8b8a1ab4ceeef8d981c8956a6";
+const zeroHash =
+    "0x0000000000000000000000000000000000000000000000000000000000000000";
 
 describe("NFTValueProvider", () => {
 	let owner: SignerWithAddress,
@@ -317,4 +316,3 @@ describe("NFTValueProvider", () => {
 		await nftValueProvider.disableFloorOverride();
 		expect(await nftValueProvider.getNFTValueETH(0)).to.equal(units(50));
 	  });
-});
