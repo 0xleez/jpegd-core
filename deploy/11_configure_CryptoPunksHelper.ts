@@ -13,13 +13,15 @@ task(
     );
     const config = await JSON.parse(fs.readFileSync(configFilePath).toString());
 
-    if (!config.punksHelper)
+    if (!config.pethPunksHelper)
         throw "No CryptoPunksHelper address in network's config file";
 
     const nftVault =
         config[
-            "nftVault-" +
-                config.punksHelper.substring(config.punksHelper.length - 5)
+            "pethNftVault-" +
+                config.pethPunksHelper.substring(
+                    config.pethPunksHelper.length - 5
+                )
         ];
     if (!nftVault) throw "No NFTVault address in network's config file";
 
@@ -28,7 +30,7 @@ task(
 
     const punksHelper = await ethers.getContractAt(
         "CryptoPunksHelper",
-        config.punksHelper
+        config.pethPunksHelper
     );
 
     await (await punksHelper.transferOwnership(nftVault)).wait();
