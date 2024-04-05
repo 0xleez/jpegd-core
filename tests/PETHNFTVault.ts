@@ -1,19 +1,16 @@
 import { BigNumber } from "@ethersproject/bignumber";
 import { SignerWithAddress } from "@nomiclabs/hardhat-ethers/signers";
-import chai from "chai";
-import { solidity } from "ethereum-waffle";
+import { expect } from "chai";
 import { AbiCoder } from "ethers/lib/utils";
 import { ethers, upgrades } from "hardhat";
 import {
     FungibleAssetVaultForDAO,
-    JPEG,
     MockV3Aggregator,
-    JPEGCardsCigStaking,
-    NFTVault,
     PETH,
     TestERC20,
     TestERC721,
-    UniswapV2MockOracle
+    PETHNFTVault,
+    JPGD
 } from "../types";
 import {
     units,
@@ -21,12 +18,9 @@ import {
     days,
     checkAlmostSame,
     currentTimestamp,
-    ZERO_ADDRESS
+    ZERO_ADDRESS,
+    bn
 } from "./utils";
-
-const { expect } = chai;
-
-chai.use(solidity);
 
 const default_admin_role =
     "0x0000000000000000000000000000000000000000000000000000000000000000";
@@ -34,6 +28,8 @@ const minter_role =
     "0x9f2df0fed2c77648de5860a4cc508cd0818c85b8b8a1ab4ceeef8d981c8956a6";
 const dao_role =
     "0x3b5d4cc60d3ec3516ee8ae083bd60934f6eb2a6c54b1229985c41bfb092b2603";
+const vault_role =
+    "0x31e0210044b4f6757ce6aa31f9c6e8d4896d24a755014887391a926c5224d959";
 const liquidator_role =
     "0x5e17fc5225d4a099df75359ce1f405503ca79498a8dc46a7d583235a0ee45c16";
 const whitelisted_role =
@@ -49,16 +45,16 @@ describe("PETHNFTVault", () => {
     let owner: SignerWithAddress,
         dao: SignerWithAddress,
         user: SignerWithAddress;
-    let nftVault: NFTVault,
+    let nftVault: PETHNFTVault,
         ethVault: FungibleAssetVaultForDAO,
+        jpgdTokenOracle: MockV3Aggregator,
         ethOracle: MockV3Aggregator,
-        jpegOracle: UniswapV2MockOracle,
         floorOracle: MockV3Aggregator,
         fallbackOracle: MockV3Aggregator,
         weth: TestERC20,
         stablecoin: PETH,
         erc721: TestERC721,
-        jpeg: JPEG;
+        jpgd: JPGD;
 
     beforeEach(async () => {
         const accounts = await ethers.getSigners();
@@ -87,7 +83,7 @@ describe("PETHNFTVault", () => {
         const MockOracle = await ethers.getContractFactory(
             "UniswapV2MockOracle"
         );
-        jpegOracle = await MockOracle.deploy(1000000000000000);
+        const jpegOracle = await MockOracle.deploy(1000000000000000);
         await jpegOracle.deployed();
 
         const MockAggregator = await ethers.getContractFactory(
@@ -96,18 +92,21 @@ describe("PETHNFTVault", () => {
         ethOracle = await MockAggregator.deploy(8, 3000e8);
         await ethOracle.deployed();
 
+        jpgdTokenOracle = await MockAggregator.deploy(18, 1000000000000000);
+        await jpgdTokenOracle.deployed();
+
         floorOracle = await MockAggregator.deploy(18, units(50));
         await floorOracle.deployed();
 
         fallbackOracle = await MockAggregator.deploy(18, units(10));
         await fallbackOracle.deployed();
 
-        const JPEG = await ethers.getContractFactory("JPEG");
+        const JPGD = await ethers.getContractFactory("JPGD");
 
-        jpeg = await JPEG.deploy(units(1000000000));
-        await jpeg.deployed();
+        jpgd = await JPGD.deploy();
+        await jpgd.deployed();
 
-        await jpeg.grantRole(minter_role, owner.address);
+        await jpgd.grantRole(minter_role, owner.address);
 
         const JPEGOraclesAggregator = await ethers.getContractFactory(
             "JPEGOraclesAggregator"
@@ -120,16 +119,21 @@ describe("PETHNFTVault", () => {
             "NFTValueProvider"
         );
         const nftValueProvider = await upgrades.deployProxy(NFTValueProvider, [
-            jpeg.address,
+            jpgd.address,
+            jpgdTokenOracle.address,
             jpegOraclesAggregator.address,
             cigStaking.address,
-            [32, 100],
-            [33, 100],
-            [7, 100],
-            [10, 100],
-            [8, 100],
-            [10, 100],
-            0
+            [
+                [32, 100],
+                [33, 100],
+                [7, 100],
+                [10, 100],
+                [8, 100],
+                [10, 100],
+                [80, 100],
+                [81, 100]
+            ],
+            86400
         ]);
 
         await jpegOraclesAggregator.addFloorOracle(
@@ -138,7 +142,7 @@ describe("PETHNFTVault", () => {
         );
 
         const NFTVault = await ethers.getContractFactory("PETHNFTVault");
-        nftVault = <NFTVault>await upgrades.deployProxy(NFTVault, [
+        nftVault = <PETHNFTVault>await upgrades.deployProxy(NFTVault, [
             stablecoin.address,
             erc721.address,
             nftValueProvider.address,
@@ -175,6 +179,7 @@ describe("PETHNFTVault", () => {
         await stablecoin.revokeRole(default_admin_role, owner.address);
         await stablecoin.connect(dao).grantRole(minter_role, nftVault.address);
         await stablecoin.connect(dao).grantRole(minter_role, ethVault.address);
+        await stablecoin.connect(dao).grantRole(minter_role, dao.address);
 
         await nftVault.grantRole(dao_role, dao.address);
         await nftVault.grantRole(liquidator_role, dao.address);
@@ -183,18 +188,20 @@ describe("PETHNFTVault", () => {
         await ethVault.grantRole(default_admin_role, dao.address);
         await ethVault.grantRole(whitelisted_role, dao.address);
         await ethVault.revokeRole(default_admin_role, owner.address);
+
+        await nftValueProvider.grantRole(vault_role, nftVault.address);
     });
 
     it("should be able to borrow", async () => {
-        await expect(nftVault.borrow(10001, 100, false)).to.be.revertedWith(
-            "InvalidNFT(10001)"
-        );
+        await expect(
+            nftVault.borrow(10001, 100, false)
+        ).to.be.revertedWithCustomError(nftVault, "InvalidNFT");
 
         await erc721.mint(user.address, 1);
 
-        await expect(nftVault.borrow(1, 0, false)).to.be.revertedWith(
-            "InvalidAmount(0)"
-        );
+        await expect(
+            nftVault.borrow(1, 0, false)
+        ).to.be.revertedWithCustomError(nftVault, "InvalidAmount");
 
         await expect(nftVault.borrow(1, 100, false)).to.be.revertedWith(
             "ERC721: transfer caller is not owner nor approved"
@@ -213,7 +220,7 @@ describe("PETHNFTVault", () => {
 
         await expect(
             nftVault.connect(user).borrow(index, borrowAmount.mul(2), false)
-        ).to.be.revertedWith("InvalidAmount(" + borrowAmount.mul(2) + ")");
+        ).to.be.revertedWithCustomError(nftVault, "InvalidAmount");
 
         const stablecoinBalanceBefore = await stablecoin.balanceOf(
             user.address
@@ -222,7 +229,7 @@ describe("PETHNFTVault", () => {
 
         await expect(
             nftVault.borrow(index, borrowAmount, false)
-        ).to.be.revertedWith("Unauthorized()");
+        ).to.be.revertedWithCustomError(nftVault, "Unauthorized");
 
         await nftVault.connect(user).borrow(index, borrowAmount.div(2), false);
 
@@ -261,31 +268,33 @@ describe("PETHNFTVault", () => {
     });
 
     it("should be able to repay", async () => {
-        await expect(nftVault.repay(10001, 100)).to.be.revertedWith(
-            "InvalidNFT(10001)"
+        await expect(nftVault.repay(10001, 100)).to.be.revertedWithCustomError(
+            nftVault,
+            "InvalidNFT"
         );
         await erc721.mint(user.address, 1);
-        await expect(nftVault.repay(1, 100)).to.be.revertedWith(
-            "Unauthorized()"
+        await expect(nftVault.repay(1, 100)).to.be.revertedWithCustomError(
+            nftVault,
+            "Unauthorized"
         );
 
         const index = 3000;
         await erc721.mint(user.address, index);
         await expect(
             nftVault.connect(user).repay(index, 100)
-        ).to.be.revertedWith("Unauthorized()");
+        ).to.be.revertedWithCustomError(nftVault, "Unauthorized");
 
         await erc721.connect(user).approve(nftVault.address, index);
         await expect(
             nftVault.connect(user).repay(index, 100)
-        ).to.be.revertedWith("Unauthorized()");
+        ).to.be.revertedWithCustomError(nftVault, "Unauthorized");
 
         const borrowAmount = units(1).mul(10);
         await nftVault.connect(user).borrow(index, borrowAmount, false);
 
-        await expect(nftVault.connect(user).repay(index, 0)).to.be.revertedWith(
-            "InvalidAmount(0)"
-        );
+        await expect(
+            nftVault.connect(user).repay(index, 0)
+        ).to.be.revertedWithCustomError(nftVault, "InvalidAmount");
 
         // pay half
         expect((await nftVault.positions(index)).debtPrincipal).to.be.equal(
@@ -332,12 +341,13 @@ describe("PETHNFTVault", () => {
     });
 
     it("should be able to close position", async () => {
-        await expect(nftVault.closePosition(10001)).to.be.revertedWith(
-            "InvalidNFT(10001)"
-        );
+        await expect(
+            nftVault.closePosition(10001)
+        ).to.be.revertedWithCustomError(nftVault, "InvalidNFT");
         await erc721.mint(user.address, 1);
-        await expect(nftVault.closePosition(1)).to.be.revertedWith(
-            "Unauthorized()"
+        await expect(nftVault.closePosition(1)).to.be.revertedWithCustomError(
+            nftVault,
+            "Unauthorized"
         );
 
         const index = 4000;
@@ -399,7 +409,7 @@ describe("PETHNFTVault", () => {
 
         await expect(
             nftVault.connect(dao).liquidate(10001, owner.address)
-        ).to.be.revertedWith("InvalidNFT(10001)");
+        ).to.be.revertedWithCustomError(nftVault, "InvalidNFT");
 
         expect(await nftVault.positionOwner(index)).to.equal(ZERO_ADDRESS);
 
@@ -412,7 +422,7 @@ describe("PETHNFTVault", () => {
 
         await expect(
             nftVault.connect(dao).liquidate(index, owner.address)
-        ).to.be.revertedWith("InvalidPosition(" + index + ")");
+        ).to.be.revertedWithCustomError(nftVault, "InvalidPosition");
 
         // dao prepares 10 peth
         const prepareAmount = units(10);
@@ -473,17 +483,17 @@ describe("PETHNFTVault", () => {
 
         await expect(
             nftVault.connect(dao).liquidate(index, owner.address)
-        ).to.be.revertedWith("PositionLiquidated(" + index + ")");
+        ).to.be.revertedWithCustomError(nftVault, "PositionLiquidated");
 
         expect(await erc721.ownerOf(index)).to.be.equal(nftVault.address);
 
         expect((await nftVault.positions(index)).liquidatedAt).to.be.gt(0);
         await expect(
             nftVault.connect(user).borrow(index, borrowAmount, false)
-        ).to.be.revertedWith("PositionLiquidated(" + index + ")");
+        ).to.be.revertedWithCustomError(nftVault, "PositionLiquidated");
         await expect(
             nftVault.connect(user).repay(index, borrowAmount)
-        ).to.be.revertedWith("PositionLiquidated(" + index + ")");
+        ).to.be.revertedWithCustomError(nftVault, "PositionLiquidated");
 
         await floorOracle.updateAnswer(units(50));
 
@@ -515,16 +525,17 @@ describe("PETHNFTVault", () => {
 
         await expect(
             nftVault.connect(user).closePosition(index)
-        ).to.be.revertedWith("PositionLiquidated(" + index + ")");
+        ).to.be.revertedWithCustomError(nftVault, "PositionLiquidated");
     });
 
     it("should be able to repurchase", async () => {
-        await expect(nftVault.repurchase(10001)).to.be.revertedWith(
-            "InvalidNFT(10001)"
-        );
+        await expect(
+            nftVault.repurchase(10001, 0)
+        ).to.be.revertedWithCustomError(nftVault, "InvalidNFT");
         await erc721.mint(owner.address, 1);
-        await expect(nftVault.repurchase(1)).to.be.revertedWith(
-            "Unauthorized()"
+        await expect(nftVault.repurchase(1, 0)).to.be.revertedWithCustomError(
+            nftVault,
+            "Unauthorized"
         );
 
         const index = 5000;
@@ -536,19 +547,16 @@ describe("PETHNFTVault", () => {
         const initialTimestamp = await currentTimestamp();
 
         await expect(
-            nftVault.connect(user).repurchase(index)
-        ).to.be.revertedWith("InvalidPosition(" + index + ")");
+            nftVault.connect(user).repurchase(index, 0)
+        ).to.be.revertedWithCustomError(nftVault, "InvalidPosition");
 
         // dao prepares 25 peth
         const prepareAmount = units(25);
-        await weth.mint(dao.address, prepareAmount);
-        await weth.connect(dao).approve(ethVault.address, prepareAmount);
-        await ethVault.connect(dao).deposit(prepareAmount);
-        await ethVault.connect(dao).borrow(prepareAmount);
+        await stablecoin.connect(dao).mint(dao.address, prepareAmount);
 
         await floorOracle.updateAnswer(units(10));
 
-        await stablecoin.connect(dao).approve(nftVault.address, units(25));
+        await stablecoin.connect(dao).approve(nftVault.address, prepareAmount);
         await nftVault.connect(dao).liquidate(index, owner.address);
 
         const elapsed = (await currentTimestamp()) - initialTimestamp;
@@ -559,19 +567,50 @@ describe("PETHNFTVault", () => {
                 .div(100)
                 .div(86400 * 365)
         );
-        const toRepurchase = totalDebt.add(totalDebt.mul(25).div(100));
-
-        await stablecoin.connect(dao).transfer(user.address, toRepurchase);
-        await stablecoin.connect(user).approve(nftVault.address, toRepurchase);
-
-        await nftVault.connect(user).repurchase(index);
 
         expect(
-            await stablecoin.allowance(user.address, nftVault.address)
-        ).to.be.closeTo(units(0), units(1) as any);
+            (await nftVault.positions(index)).debtAmountForRepurchase
+        ).to.equal(totalDebt);
 
-        expect(await nftVault.openPositionsIndexes()).to.deep.equal([]);
-        expect(await nftVault.totalPositions()).to.equal(0);
+        const creditLimit = await nftVault.getCreditLimit(user.address, index);
+        const repayAmount = totalDebt.sub(creditLimit);
+        const penalty = totalDebt.mul(25).div(100);
+
+        const amountBeforeRepurchase = await stablecoin.balanceOf(user.address);
+        const feeCollectedBeforeRepurchase = await nftVault.totalFeeCollected();
+
+        await stablecoin
+            .connect(dao)
+            .mint(user.address, repayAmount.add(penalty));
+        await stablecoin
+            .connect(user)
+            .approve(nftVault.address, repayAmount.add(penalty));
+
+        await expect(
+            nftVault.connect(user).repurchase(index, repayAmount.sub(1))
+        ).to.be.revertedWithCustomError(nftVault, "InvalidAmount");
+
+        await nftVault.connect(user).repurchase(index, repayAmount);
+
+        expect(await nftVault.openPositionsIndexes()).to.deep.equal([
+            bn(index)
+        ]);
+        expect(await nftVault.totalPositions()).to.equal(1);
+
+        const position = await nftVault.positions(index);
+
+        expect(position.debtPrincipal).to.equal(creditLimit);
+        expect(position.debtAmountForRepurchase).to.equal(0);
+        expect(position.liquidatedAt).to.equal(0);
+        expect(position.liquidator).to.equal(ZERO_ADDRESS);
+
+        expect(await stablecoin.balanceOf(dao.address)).to.equal(prepareAmount);
+        expect(await stablecoin.balanceOf(user.address)).to.equal(
+            amountBeforeRepurchase
+        );
+        expect(await nftVault.totalFeeCollected()).to.equal(
+            feeCollectedBeforeRepurchase.add(penalty)
+        );
     });
 
     it("should allow users to deposit NFTs in whitelisted strategies", async () => {
@@ -597,7 +636,7 @@ describe("PETHNFTVault", () => {
         await flash.shouldSendBack(false);
         await expect(
             nftVault.connect(user).depositInStrategy(indexes, 0, "0x")
-        ).to.be.revertedWith("InvalidStrategy()");
+        ).to.be.revertedWithCustomError(nftVault, "InvalidStrategy");
 
         await flash.shouldSendBack(true);
         await nftVault.connect(user).depositInStrategy(indexes, 0, "0x");
@@ -625,7 +664,7 @@ describe("PETHNFTVault", () => {
 
         await expect(
             nftVault.connect(user).withdrawFromStrategy(indexes)
-        ).to.be.revertedWith("InvalidStrategy()");
+        ).to.be.revertedWithCustomError(nftVault, "InvalidStrategy");
 
         await standard.shouldSendBack(true);
         await nftVault.connect(user).withdrawFromStrategy(indexes);
@@ -674,20 +713,20 @@ describe("PETHNFTVault", () => {
             nftVault
                 .connect(user)
                 .flashStrategyFromStandardStrategy([], 1, 0, "0x", "0x")
-        ).to.be.revertedWith("InvalidLength()");
+        ).to.be.revertedWithCustomError(nftVault, "InvalidLength");
 
         await expect(
             nftVault
                 .connect(user)
                 .flashStrategyFromStandardStrategy([100], 0, 1, "0x", "0x")
-        ).to.be.revertedWith("InvalidStrategy()");
+        ).to.be.revertedWithCustomError(nftVault, "InvalidStrategy");
 
         await flash.shouldSendBack(false);
         await expect(
             nftVault
                 .connect(user)
                 .flashStrategyFromStandardStrategy([100], 1, 0, "0x", "0x")
-        ).to.be.revertedWith("InvalidStrategy()");
+        ).to.be.revertedWithCustomError(nftVault, "InvalidStrategy");
 
         await flash.shouldSendBack(true);
         await nftVault
@@ -756,7 +795,7 @@ describe("PETHNFTVault", () => {
         await stablecoin.connect(dao).approve(nftVault.address, units(70000));
         await expect(
             nftVault.connect(dao).claimExpiredInsuranceNFT(index, owner.address)
-        ).to.be.revertedWith("InvalidPosition(" + index + ")");
+        ).to.be.revertedWithCustomError(nftVault, "InvalidPosition");
         await nftVault.connect(dao).liquidate(index, owner.address);
 
         const elapsed = (await currentTimestamp()) - initialTimestamp;
@@ -774,17 +813,20 @@ describe("PETHNFTVault", () => {
 
         await expect(
             nftVault.connect(dao).claimExpiredInsuranceNFT(index, owner.address)
-        ).to.be.revertedWith("PositionInsuranceNotExpired(" + index + ")");
+        ).to.be.revertedWithCustomError(
+            nftVault,
+            "PositionInsuranceNotExpired"
+        );
 
         await timeTravel(86400 * 3);
 
         await expect(
-            nftVault.connect(user).repurchase(index)
-        ).to.be.revertedWith("PositionInsuranceExpired(" + index + ")");
+            nftVault.connect(user).repurchase(index, totalDebt)
+        ).to.be.revertedWithCustomError(nftVault, "PositionInsuranceExpired");
 
         await expect(
             nftVault.claimExpiredInsuranceNFT(index, owner.address)
-        ).to.be.revertedWith("Unauthorized()");
+        ).to.be.revertedWithCustomError(nftVault, "Unauthorized");
 
         await nftVault
             .connect(dao)
@@ -792,7 +834,7 @@ describe("PETHNFTVault", () => {
         expect(await erc721.ownerOf(index)).to.equal(owner.address);
         await expect(
             nftVault.connect(dao).claimExpiredInsuranceNFT(index, owner.address)
-        ).to.be.revertedWith("InvalidPosition(" + index + ")");
+        ).to.be.revertedWithCustomError(nftVault, "InvalidPosition");
 
         expect(await nftVault.openPositionsIndexes()).to.deep.equal([]);
         expect(await nftVault.totalPositions()).to.equal(0);
@@ -820,7 +862,7 @@ describe("PETHNFTVault", () => {
 
         await expect(
             nftVault.forceClosePosition(owner.address, index1, owner.address)
-        ).to.be.revertedWith("Unauthorized()");
+        ).to.be.revertedWithCustomError(nftVault, "Unauthorized");
 
         await nftVault.forceClosePosition(user.address, index1, owner.address);
 
@@ -861,7 +903,7 @@ describe("PETHNFTVault", () => {
                 true,
                 standard.address
             )
-        ).to.be.revertedWith("DebtCapReached()");
+        ).to.be.revertedWithCustomError(nftVault, "DebtCapReached");
         await expect(
             nftVault.importPosition(
                 user.address,
@@ -870,9 +912,7 @@ describe("PETHNFTVault", () => {
                 true,
                 standard.address
             )
-        ).to.be.revertedWith(
-            "InvalidAmount(" + units(2000).mul(1000).toString() + ")"
-        );
+        ).to.be.revertedWithCustomError(nftVault, "InvalidAmount");
         await expect(
             nftVault.importPosition(
                 user.address,
@@ -881,7 +921,7 @@ describe("PETHNFTVault", () => {
                 true,
                 standard.address
             )
-        ).to.be.revertedWith("InvalidStrategy()");
+        ).to.be.revertedWithCustomError(nftVault, "InvalidStrategy");
 
         await nftVault.connect(dao).addStrategy(standard.address);
 
@@ -893,7 +933,7 @@ describe("PETHNFTVault", () => {
                 true,
                 standard.address
             )
-        ).to.be.revertedWith("InvalidStrategy()");
+        ).to.be.revertedWithCustomError(nftVault, "InvalidStrategy");
         await erc721
             .connect(user)
             .transferFrom(user.address, standard.address, index1);
@@ -926,7 +966,7 @@ describe("PETHNFTVault", () => {
                 true,
                 ZERO_ADDRESS
             )
-        ).to.be.revertedWith("Unauthorized()");
+        ).to.be.revertedWithCustomError(nftVault, "Unauthorized");
         await expect(
             nftVault.importPosition(
                 user.address,
@@ -935,7 +975,7 @@ describe("PETHNFTVault", () => {
                 true,
                 ZERO_ADDRESS
             )
-        ).to.be.revertedWith("Unauthorized()");
+        ).to.be.revertedWithCustomError(nftVault, "Unauthorized");
 
         await erc721
             .connect(user)
@@ -977,8 +1017,8 @@ describe("PETHNFTVault", () => {
         await erc721.mint(user.address, index2);
         await erc721.connect(user).setApprovalForAll(nftVault.address, true);
 
-        await jpeg.mint(user.address, units(36000));
-        await jpeg.connect(user).approve(nftVault.address, units(36000));
+        await jpgd.mint(user.address, units(36000));
+        await jpgd.connect(user).approve(nftVault.address, units(36000));
 
         await stablecoin.connect(user).approve(nftVault.address, borrowAmount1);
 

@@ -1,19 +1,16 @@
 import { BigNumber } from "@ethersproject/bignumber";
 import { SignerWithAddress } from "@nomiclabs/hardhat-ethers/signers";
-import chai from "chai";
-import { solidity } from "ethereum-waffle";
+import { expect } from "chai";
 import { AbiCoder } from "ethers/lib/utils";
 import { ethers, upgrades } from "hardhat";
 import {
     FungibleAssetVaultForDAO,
-    JPEG,
+    JPGD,
     MockV3Aggregator,
-    JPEGCardsCigStaking,
     NFTVault,
     StableCoin,
     TestERC20,
-    TestERC721,
-    UniswapV2MockOracle
+    TestERC721
 } from "../types";
 import {
     units,
@@ -21,12 +18,9 @@ import {
     days,
     checkAlmostSame,
     currentTimestamp,
-    ZERO_ADDRESS
+    ZERO_ADDRESS,
+    bn
 } from "./utils";
-
-const { expect } = chai;
-
-chai.use(solidity);
 
 const default_admin_role =
     "0x0000000000000000000000000000000000000000000000000000000000000000";
@@ -36,6 +30,8 @@ const dao_role =
     "0x3b5d4cc60d3ec3516ee8ae083bd60934f6eb2a6c54b1229985c41bfb092b2603";
 const liquidator_role =
     "0x5e17fc5225d4a099df75359ce1f405503ca79498a8dc46a7d583235a0ee45c16";
+const vault_role =
+    "0x31e0210044b4f6757ce6aa31f9c6e8d4896d24a755014887391a926c5224d959";
 const whitelisted_role =
     "0x8429d542926e6695b59ac6fbdcd9b37e8b1aeb757afab06ab60b1bb5878c3b49";
 const router_role =
@@ -51,14 +47,14 @@ describe("NFTVault", () => {
         user: SignerWithAddress;
     let nftVault: NFTVault,
         usdcVault: FungibleAssetVaultForDAO,
-        jpegOracle: UniswapV2MockOracle,
+        jpgdTokenOracle: MockV3Aggregator,
         ethOracle: MockV3Aggregator,
         usd_oracle: MockV3Aggregator,
         fallbackOracle: MockV3Aggregator,
         usdc: TestERC20,
         stablecoin: StableCoin,
         erc721: TestERC721,
-        jpeg: JPEG;
+        jpgd: JPGD;
 
     beforeEach(async () => {
         const accounts = await ethers.getSigners();
@@ -87,7 +83,7 @@ describe("NFTVault", () => {
         const MockOracle = await ethers.getContractFactory(
             "UniswapV2MockOracle"
         );
-        jpegOracle = await MockOracle.deploy(1000000000000000);
+        const jpegOracle = await MockOracle.deploy(1000000000000000);
         await jpegOracle.deployed();
 
         const MockAggregator = await ethers.getContractFactory(
@@ -95,6 +91,9 @@ describe("NFTVault", () => {
         );
         ethOracle = await MockAggregator.deploy(8, 3000e8);
         await ethOracle.deployed();
+
+        jpgdTokenOracle = await MockAggregator.deploy(18, 1000000000000000);
+        await jpgdTokenOracle.deployed();
 
         const floorOracle = await MockAggregator.deploy(18, units(50));
         await floorOracle.deployed();
@@ -105,12 +104,12 @@ describe("NFTVault", () => {
         usd_oracle = await MockAggregator.deploy(8, 1e8);
         await usd_oracle.deployed();
 
-        const JPEG = await ethers.getContractFactory("JPEG");
+        const JPGD = await ethers.getContractFactory("JPGD");
 
-        jpeg = await JPEG.deploy(units(1000000000));
-        await jpeg.deployed();
+        jpgd = await JPGD.deploy();
+        await jpgd.deployed();
 
-        await jpeg.grantRole(minter_role, owner.address);
+        await jpgd.grantRole(minter_role, owner.address);
 
         const JPEGOraclesAggregator = await ethers.getContractFactory(
             "JPEGOraclesAggregator"
@@ -122,17 +121,23 @@ describe("NFTVault", () => {
         const NFTValueProvider = await ethers.getContractFactory(
             "NFTValueProvider"
         );
+
         const nftValueProvider = await upgrades.deployProxy(NFTValueProvider, [
-            jpeg.address,
+            jpgd.address,
+            jpgdTokenOracle.address,
             jpegOraclesAggregator.address,
             cigStaking.address,
-            [32, 100],
-            [33, 100],
-            [7, 100],
-            [10, 100],
-            [8, 100],
-            [10, 100],
-            0
+            [
+                [32, 100],
+                [33, 100],
+                [7, 100],
+                [10, 100],
+                [8, 100],
+                [10, 100],
+                [80, 100],
+                [81, 100]
+            ],
+            86400
         ]);
 
         await jpegOraclesAggregator.addFloorOracle(
@@ -179,6 +184,7 @@ describe("NFTVault", () => {
         await stablecoin.revokeRole(default_admin_role, owner.address);
         await stablecoin.connect(dao).grantRole(minter_role, nftVault.address);
         await stablecoin.connect(dao).grantRole(minter_role, usdcVault.address);
+        await stablecoin.connect(dao).grantRole(minter_role, dao.address);
 
         await nftVault.grantRole(dao_role, dao.address);
         await nftVault.grantRole(liquidator_role, dao.address);
@@ -187,18 +193,20 @@ describe("NFTVault", () => {
         await usdcVault.grantRole(default_admin_role, dao.address);
         await usdcVault.grantRole(whitelisted_role, dao.address);
         await usdcVault.revokeRole(default_admin_role, owner.address);
+
+        await nftValueProvider.grantRole(vault_role, nftVault.address);
     });
 
     it("should be able to borrow", async () => {
-        await expect(nftVault.borrow(10001, 100, false)).to.be.revertedWith(
-            "InvalidNFT(10001)"
-        );
+        await expect(
+            nftVault.borrow(10001, 100, false)
+        ).to.be.revertedWithCustomError(nftVault, "InvalidNFT");
 
         await erc721.mint(user.address, 1);
 
-        await expect(nftVault.borrow(1, 0, false)).to.be.revertedWith(
-            "InvalidAmount(0)"
-        );
+        await expect(
+            nftVault.borrow(1, 0, false)
+        ).to.be.revertedWithCustomError(nftVault, "InvalidAmount");
 
         await expect(nftVault.borrow(1, 100, false)).to.be.revertedWith(
             "ERC721: transfer caller is not owner nor approved"
@@ -217,7 +225,7 @@ describe("NFTVault", () => {
 
         await expect(
             nftVault.connect(user).borrow(index, borrowAmount.mul(2), false)
-        ).to.be.revertedWith("InvalidAmount(" + borrowAmount.mul(2) + ")");
+        ).to.be.revertedWithCustomError(nftVault, "InvalidAmount");
 
         const stablecoinBalanceBefore = await stablecoin.balanceOf(
             user.address
@@ -226,7 +234,7 @@ describe("NFTVault", () => {
 
         await expect(
             nftVault.borrow(index, borrowAmount, false)
-        ).to.be.revertedWith("Unauthorized()");
+        ).to.be.revertedWithCustomError(nftVault, "Unauthorized");
 
         await nftVault.connect(user).borrow(index, borrowAmount.div(2), false);
 
@@ -265,31 +273,33 @@ describe("NFTVault", () => {
     });
 
     it("should be able to repay", async () => {
-        await expect(nftVault.repay(10001, 100)).to.be.revertedWith(
-            "InvalidNFT(10001)"
+        await expect(nftVault.repay(10001, 100)).to.be.revertedWithCustomError(
+            nftVault,
+            "InvalidNFT"
         );
         await erc721.mint(user.address, 1);
-        await expect(nftVault.repay(1, 100)).to.be.revertedWith(
-            "Unauthorized()"
+        await expect(nftVault.repay(1, 100)).to.be.revertedWithCustomError(
+            nftVault,
+            "Unauthorized"
         );
 
         const index = 3000;
         await erc721.mint(user.address, index);
         await expect(
             nftVault.connect(user).repay(index, 100)
-        ).to.be.revertedWith("Unauthorized()");
+        ).to.be.revertedWithCustomError(nftVault, "Unauthorized");
 
         await erc721.connect(user).approve(nftVault.address, index);
         await expect(
             nftVault.connect(user).repay(index, 100)
-        ).to.be.revertedWith("Unauthorized()");
+        ).to.be.revertedWithCustomError(nftVault, "Unauthorized");
 
         const borrowAmount = units(3000).mul(10);
         await nftVault.connect(user).borrow(index, borrowAmount, false);
 
-        await expect(nftVault.connect(user).repay(index, 0)).to.be.revertedWith(
-            "InvalidAmount(0)"
-        );
+        await expect(
+            nftVault.connect(user).repay(index, 0)
+        ).to.be.revertedWithCustomError(nftVault, "InvalidAmount");
 
         // pay half
         expect((await nftVault.positions(index)).debtPrincipal).to.be.equal(
@@ -336,12 +346,13 @@ describe("NFTVault", () => {
     });
 
     it("should be able to close position", async () => {
-        await expect(nftVault.closePosition(10001)).to.be.revertedWith(
-            "InvalidNFT(10001)"
-        );
+        await expect(
+            nftVault.closePosition(10001)
+        ).to.be.revertedWithCustomError(nftVault, "InvalidNFT");
         await erc721.mint(user.address, 1);
-        await expect(nftVault.closePosition(1)).to.be.revertedWith(
-            "Unauthorized()"
+        await expect(nftVault.closePosition(1)).to.be.revertedWithCustomError(
+            nftVault,
+            "Unauthorized"
         );
 
         const index = 4000;
@@ -403,7 +414,7 @@ describe("NFTVault", () => {
 
         await expect(
             nftVault.connect(dao).liquidate(10001, owner.address)
-        ).to.be.revertedWith("InvalidNFT(10001)");
+        ).to.be.revertedWithCustomError(nftVault, "InvalidNFT");
 
         expect(await nftVault.positionOwner(index)).to.equal(ZERO_ADDRESS);
 
@@ -416,7 +427,7 @@ describe("NFTVault", () => {
 
         await expect(
             nftVault.connect(dao).liquidate(index, owner.address)
-        ).to.be.revertedWith("InvalidPosition(" + index + ")");
+        ).to.be.revertedWithCustomError(nftVault, "InvalidPosition");
 
         // dao prepares 30000 PUSD
         const prepareAmount = units(30000);
@@ -477,17 +488,17 @@ describe("NFTVault", () => {
 
         await expect(
             nftVault.connect(dao).liquidate(index, owner.address)
-        ).to.be.revertedWith("PositionLiquidated(" + index + ")");
+        ).to.be.revertedWithCustomError(nftVault, "PositionLiquidated");
 
         expect(await erc721.ownerOf(index)).to.be.equal(nftVault.address);
 
         expect((await nftVault.positions(index)).liquidatedAt).to.be.gt(0);
         await expect(
             nftVault.connect(user).borrow(index, borrowAmount, false)
-        ).to.be.revertedWith("PositionLiquidated(" + index + ")");
+        ).to.be.revertedWithCustomError(nftVault, "PositionLiquidated");
         await expect(
             nftVault.connect(user).repay(index, borrowAmount)
-        ).to.be.revertedWith("PositionLiquidated(" + index + ")");
+        ).to.be.revertedWithCustomError(nftVault, "PositionLiquidated");
 
         // treat to change back eth price
         await ethOracle.updateAnswer(3000e8);
@@ -521,16 +532,17 @@ describe("NFTVault", () => {
 
         await expect(
             nftVault.connect(user).closePosition(index)
-        ).to.be.revertedWith("PositionLiquidated(" + index + ")");
+        ).to.be.revertedWithCustomError(nftVault, "PositionLiquidated");
     });
 
     it("should be able to repurchase", async () => {
-        await expect(nftVault.repurchase(10001)).to.be.revertedWith(
-            "InvalidNFT(10001)"
-        );
+        await expect(
+            nftVault.repurchase(10001, 0)
+        ).to.be.revertedWithCustomError(nftVault, "InvalidNFT");
         await erc721.mint(owner.address, 1);
-        await expect(nftVault.repurchase(1)).to.be.revertedWith(
-            "Unauthorized()"
+        await expect(nftVault.repurchase(1, 0)).to.be.revertedWithCustomError(
+            nftVault,
+            "Unauthorized"
         );
 
         const index = 5000;
@@ -542,20 +554,16 @@ describe("NFTVault", () => {
         const initialTimestamp = await currentTimestamp();
 
         await expect(
-            nftVault.connect(user).repurchase(index)
-        ).to.be.revertedWith("InvalidPosition(" + index + ")");
+            nftVault.connect(user).repurchase(index, 0)
+        ).to.be.revertedWithCustomError(nftVault, "InvalidPosition");
 
         // dao prepares 70000 PUSD
         const prepareAmount = units(70000);
-        await usdc.mint(dao.address, prepareAmount);
-        await usdc.connect(dao).approve(usdcVault.address, prepareAmount);
-        await usdcVault.connect(dao).deposit(prepareAmount);
-        await usdcVault.connect(dao).borrow(prepareAmount);
+        await stablecoin.connect(dao).mint(dao.address, prepareAmount);
 
-        // treat to change eth price
         await ethOracle.updateAnswer(100e8);
 
-        await stablecoin.connect(dao).approve(nftVault.address, units(70000));
+        await stablecoin.connect(dao).approve(nftVault.address, prepareAmount);
         await nftVault.connect(dao).liquidate(index, owner.address);
 
         const elapsed = (await currentTimestamp()) - initialTimestamp;
@@ -566,19 +574,50 @@ describe("NFTVault", () => {
                 .div(100)
                 .div(86400 * 365)
         );
-        const toRepurchase = totalDebt.add(totalDebt.mul(25).div(100));
-
-        await stablecoin.connect(dao).transfer(user.address, toRepurchase);
-        await stablecoin.connect(user).approve(nftVault.address, toRepurchase);
-
-        await nftVault.connect(user).repurchase(index);
 
         expect(
-            await stablecoin.allowance(user.address, nftVault.address)
-        ).to.be.closeTo(units(0), units(1) as any);
+            (await nftVault.positions(index)).debtAmountForRepurchase
+        ).to.equal(totalDebt);
 
-        expect(await nftVault.openPositionsIndexes()).to.deep.equal([]);
-        expect(await nftVault.totalPositions()).to.equal(0);
+        const creditLimit = await nftVault.getCreditLimit(user.address, index);
+        const repayAmount = totalDebt.sub(creditLimit);
+        const penalty = totalDebt.mul(25).div(100);
+
+        const amountBeforeRepurchase = await stablecoin.balanceOf(user.address);
+        const feeCollectedBeforeRepurchase = await nftVault.totalFeeCollected();
+
+        await stablecoin
+            .connect(dao)
+            .mint(user.address, repayAmount.add(penalty));
+        await stablecoin
+            .connect(user)
+            .approve(nftVault.address, repayAmount.add(penalty));
+
+        await expect(
+            nftVault.connect(user).repurchase(index, repayAmount.sub(1))
+        ).to.be.revertedWithCustomError(nftVault, `InvalidAmount`);
+
+        await nftVault.connect(user).repurchase(index, repayAmount);
+
+        expect(await nftVault.openPositionsIndexes()).to.deep.equal([
+            bn(index)
+        ]);
+        expect(await nftVault.totalPositions()).to.equal(1);
+
+        const position = await nftVault.positions(index);
+
+        expect(position.debtPrincipal).to.equal(creditLimit);
+        expect(position.debtAmountForRepurchase).to.equal(0);
+        expect(position.liquidatedAt).to.equal(0);
+        expect(position.liquidator).to.equal(ZERO_ADDRESS);
+
+        expect(await stablecoin.balanceOf(dao.address)).to.equal(prepareAmount);
+        expect(await stablecoin.balanceOf(user.address)).to.equal(
+            amountBeforeRepurchase
+        );
+        expect(await nftVault.totalFeeCollected()).to.equal(
+            feeCollectedBeforeRepurchase.add(penalty)
+        );
     });
 
     it("should allow users to deposit NFTs in whitelisted strategies", async () => {
@@ -604,7 +643,7 @@ describe("NFTVault", () => {
         await flash.shouldSendBack(false);
         await expect(
             nftVault.connect(user).depositInStrategy(indexes, 0, "0x")
-        ).to.be.revertedWith("InvalidStrategy()");
+        ).to.be.revertedWithCustomError(nftVault, "InvalidStrategy");
 
         await flash.shouldSendBack(true);
         await nftVault.connect(user).depositInStrategy(indexes, 0, "0x");
@@ -632,7 +671,7 @@ describe("NFTVault", () => {
 
         await expect(
             nftVault.connect(user).withdrawFromStrategy(indexes)
-        ).to.be.revertedWith("InvalidStrategy()");
+        ).to.be.revertedWithCustomError(nftVault, "InvalidStrategy");
 
         await standard.shouldSendBack(true);
         await nftVault.connect(user).withdrawFromStrategy(indexes);
@@ -681,20 +720,20 @@ describe("NFTVault", () => {
             nftVault
                 .connect(user)
                 .flashStrategyFromStandardStrategy([], 1, 0, "0x", "0x")
-        ).to.be.revertedWith("InvalidLength()");
+        ).to.be.revertedWithCustomError(nftVault, "InvalidLength");
 
         await expect(
             nftVault
                 .connect(user)
                 .flashStrategyFromStandardStrategy([100], 0, 1, "0x", "0x")
-        ).to.be.revertedWith("InvalidStrategy()");
+        ).to.be.revertedWithCustomError(nftVault, "InvalidStrategy");
 
         await flash.shouldSendBack(false);
         await expect(
             nftVault
                 .connect(user)
                 .flashStrategyFromStandardStrategy([100], 1, 0, "0x", "0x")
-        ).to.be.revertedWith("InvalidStrategy()");
+        ).to.be.revertedWithCustomError(nftVault, "InvalidStrategy");
 
         await flash.shouldSendBack(true);
         await nftVault
@@ -789,7 +828,7 @@ describe("NFTVault", () => {
         expect(await nftVault.totalPositions()).to.equal(1);
     });
 
-    it("should allow the liquidator to claim an nft with expired insurance", async () => {
+    it("should allow the liquidator to claim an jpgd with expired insurance", async () => {
         const index = 5000;
         await erc721.mint(user.address, index);
         await erc721.connect(user).approve(nftVault.address, index);
@@ -811,7 +850,7 @@ describe("NFTVault", () => {
         await stablecoin.connect(dao).approve(nftVault.address, units(70000));
         await expect(
             nftVault.connect(dao).claimExpiredInsuranceNFT(index, owner.address)
-        ).to.be.revertedWith("InvalidPosition(" + index + ")");
+        ).to.be.revertedWithCustomError(nftVault, "InvalidPosition");
         await nftVault.connect(dao).liquidate(index, owner.address);
 
         const elapsed = (await currentTimestamp()) - initialTimestamp;
@@ -829,17 +868,20 @@ describe("NFTVault", () => {
 
         await expect(
             nftVault.connect(dao).claimExpiredInsuranceNFT(index, owner.address)
-        ).to.be.revertedWith("PositionInsuranceNotExpired(" + index + ")");
+        ).to.be.revertedWithCustomError(
+            nftVault,
+            "PositionInsuranceNotExpired"
+        );
 
         await timeTravel(86400 * 3);
 
         await expect(
-            nftVault.connect(user).repurchase(index)
-        ).to.be.revertedWith("PositionInsuranceExpired(" + index + ")");
+            nftVault.connect(user).repurchase(index, totalDebt)
+        ).to.be.revertedWithCustomError(nftVault, "PositionInsuranceExpired");
 
         await expect(
             nftVault.claimExpiredInsuranceNFT(index, owner.address)
-        ).to.be.revertedWith("Unauthorized()");
+        ).to.be.revertedWithCustomError(nftVault, "Unauthorized");
 
         await nftVault
             .connect(dao)
@@ -847,7 +889,7 @@ describe("NFTVault", () => {
         expect(await erc721.ownerOf(index)).to.equal(owner.address);
         await expect(
             nftVault.connect(dao).claimExpiredInsuranceNFT(index, owner.address)
-        ).to.be.revertedWith("InvalidPosition(" + index + ")");
+        ).to.be.revertedWithCustomError(nftVault, "InvalidPosition");
 
         expect(await nftVault.openPositionsIndexes()).to.deep.equal([]);
         expect(await nftVault.totalPositions()).to.equal(0);
@@ -875,7 +917,7 @@ describe("NFTVault", () => {
 
         await expect(
             nftVault.forceClosePosition(owner.address, index1, owner.address)
-        ).to.be.revertedWith("Unauthorized()");
+        ).to.be.revertedWithCustomError(nftVault, "Unauthorized");
 
         await nftVault.forceClosePosition(user.address, index1, owner.address);
 
@@ -916,7 +958,7 @@ describe("NFTVault", () => {
                 true,
                 standard.address
             )
-        ).to.be.revertedWith("DebtCapReached()");
+        ).to.be.revertedWithCustomError(nftVault, "DebtCapReached");
         await expect(
             nftVault.importPosition(
                 user.address,
@@ -925,9 +967,7 @@ describe("NFTVault", () => {
                 true,
                 standard.address
             )
-        ).to.be.revertedWith(
-            "InvalidAmount(" + units(2000).mul(1000).toString() + ")"
-        );
+        ).to.be.revertedWithCustomError(nftVault, "InvalidAmount");
         await expect(
             nftVault.importPosition(
                 user.address,
@@ -936,7 +976,7 @@ describe("NFTVault", () => {
                 true,
                 standard.address
             )
-        ).to.be.revertedWith("InvalidStrategy()");
+        ).to.be.revertedWithCustomError(nftVault, "InvalidStrategy");
 
         await nftVault.connect(dao).addStrategy(standard.address);
 
@@ -948,7 +988,7 @@ describe("NFTVault", () => {
                 true,
                 standard.address
             )
-        ).to.be.revertedWith("InvalidStrategy()");
+        ).to.be.revertedWithCustomError(nftVault, "InvalidStrategy");
         await erc721
             .connect(user)
             .transferFrom(user.address, standard.address, index1);
@@ -981,7 +1021,7 @@ describe("NFTVault", () => {
                 true,
                 ZERO_ADDRESS
             )
-        ).to.be.revertedWith("Unauthorized()");
+        ).to.be.revertedWithCustomError(nftVault, "Unauthorized");
         await expect(
             nftVault.importPosition(
                 user.address,
@@ -990,7 +1030,7 @@ describe("NFTVault", () => {
                 true,
                 ZERO_ADDRESS
             )
-        ).to.be.revertedWith("Unauthorized()");
+        ).to.be.revertedWithCustomError(nftVault, "Unauthorized");
 
         await erc721
             .connect(user)
@@ -1032,8 +1072,8 @@ describe("NFTVault", () => {
         await erc721.mint(user.address, index2);
         await erc721.connect(user).setApprovalForAll(nftVault.address, true);
 
-        await jpeg.mint(user.address, units(36000));
-        await jpeg.connect(user).approve(nftVault.address, units(36000));
+        await jpgd.mint(user.address, units(36000));
+        await jpgd.connect(user).approve(nftVault.address, units(36000));
 
         await stablecoin.connect(user).approve(nftVault.address, borrowAmount1);
 

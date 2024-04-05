@@ -1,19 +1,23 @@
 import { SignerWithAddress } from "@nomiclabs/hardhat-ethers/signers";
-import chai from "chai";
-import { solidity } from "ethereum-waffle";
+import { expect } from "chai";
+import { BigNumber, BigNumberish } from "ethers";
 import { ethers, upgrades } from "hardhat";
 import {
-    JPEG,
     JPEGCardsCigStaking,
-    NFTValueProvider,
-    TestERC721,
-    UniswapV2MockOracle
+    MockNFTValueProviderMigration,
+    JPGD,
+    TestERC721
 } from "../types";
-import { units, bn, timeTravel } from "./utils";
-
-const { expect } = chai;
-
-chai.use(solidity);
+import {
+    units,
+    bn,
+    timeTravel,
+    setNextTimestamp,
+    currentTimestamp,
+    ZERO_ADDRESS
+} from "./utils";
+import { MockV3Aggregator } from "../types/MockV3Aggregator";
+import { JPEG } from "../types/JPEG";
 
 const apeHash =
     "0x26bca2ecad19e981c90a8c6efd8ee9856bbc5a2042259e6ee31e310fdc08d970";
@@ -22,13 +26,33 @@ const minterRole =
 const zeroHash =
     "0x0000000000000000000000000000000000000000000000000000000000000000";
 
+const baseCreditLimitRate = [60, 100];
+const baseLiquidationLimitRate = [70, 100];
+const cigBoostRateIncrease = [10, 100];
+const ltvBoostMaxRateIncrease = [2000, 10000];
+const traitBoostLockRate = [35, 100];
+const ltvBoostLockRate = [2_000, 10_000];
+const ltvRateCap = [80, 100];
+const liquidationRateCap = [81, 100];
+const locksReleaseDelay = 7 * 86400;
+
+const nftTokenPrice = bn("1000000000000000");
+const floor = units(50);
+
+function sumRates(r1: BigNumberish[], ...remaining: BigNumberish[][]) {
+    return remaining.reduce<BigNumber[]>(
+        (p, c) => [p[0].mul(c[1]).add(p[1].mul(c[0])), p[1].mul(c[1])],
+        [bn(r1[0]), bn(r1[1])]
+    );
+}
+
 describe("NFTValueProvider", () => {
     let owner: SignerWithAddress, user: SignerWithAddress;
-    let nftValueProvider: NFTValueProvider,
-        jpegOracle: UniswapV2MockOracle,
+    let nftValueProvider: MockNFTValueProviderMigration,
+        nftTokenOracle: MockV3Aggregator,
         cigStaking: JPEGCardsCigStaking,
         erc721: TestERC721,
-        jpeg: JPEG;
+        jpgdToken: JPGD;
 
     beforeEach(async () => {
         const accounts = await ethers.getSigners();
@@ -38,21 +62,24 @@ describe("NFTValueProvider", () => {
         const MockOracle = await ethers.getContractFactory(
             "UniswapV2MockOracle"
         );
-        jpegOracle = await MockOracle.deploy(1000000000000000);
+        const jpegOracle = await MockOracle.deploy(nftTokenPrice);
         await jpegOracle.deployed();
 
         const MockAggregator = await ethers.getContractFactory(
             "MockV3Aggregator"
         );
-        const floorOracle = await MockAggregator.deploy(18, units(50));
+        const floorOracle = await MockAggregator.deploy(18, floor);
         await floorOracle.deployed();
 
-        const JPEG = await ethers.getContractFactory("JPEG");
+        nftTokenOracle = await MockAggregator.deploy(18, nftTokenPrice);
+        await nftTokenOracle.deployed();
 
-        jpeg = await JPEG.deploy(units(1000000000));
-        await jpeg.deployed();
+        const JPGD = await ethers.getContractFactory("JPGD");
 
-        await jpeg.grantRole(minterRole, owner.address);
+        jpgdToken = await JPGD.deploy();
+        await jpgdToken.deployed();
+
+        await jpgdToken.grantRole(minterRole, owner.address);
 
         const JPEGOraclesAggregator = await ethers.getContractFactory(
             "JPEGOraclesAggregator"
@@ -72,20 +99,25 @@ describe("NFTValueProvider", () => {
         await cigStaking.deployed();
 
         const NFTValueProvider = await ethers.getContractFactory(
-            "NFTValueProvider"
+            "MockNFTValueProviderMigration"
         );
-        nftValueProvider = <NFTValueProvider>(
+        nftValueProvider = <MockNFTValueProviderMigration>(
             await upgrades.deployProxy(NFTValueProvider, [
-                jpeg.address,
+                jpgdToken.address,
+                nftTokenOracle.address,
                 jpegOraclesAggregator.address,
                 cigStaking.address,
-                [32, 100],
-                [33, 100],
-                [7, 100],
-                [10, 100],
-                [8, 100],
-                [10, 100],
-                0
+                [
+                    baseCreditLimitRate,
+                    baseLiquidationLimitRate,
+                    cigBoostRateIncrease,
+                    ltvBoostMaxRateIncrease,
+                    traitBoostLockRate,
+                    ltvBoostLockRate,
+                    ltvRateCap,
+                    liquidationRateCap
+                ],
+                locksReleaseDelay
             ])
         );
         await nftValueProvider.deployed();
@@ -97,23 +129,22 @@ describe("NFTValueProvider", () => {
     });
 
     it("should return the collection's floor price when calling getFloorETH", async () => {
-        expect(await nftValueProvider.getFloorETH()).to.equal(units(50));
+        expect(await nftValueProvider.getFloorETH()).to.equal(floor);
     });
 
-    it("should return the collection's floor price when calling getNFTValueETH with a floor NFT", async () => {
-        expect(await nftValueProvider.getNFTValueETH(0)).to.equal(units(50));
+    it("should return the collection's floor price when calling getNFTValueETH with a floor JPGD", async () => {
+        expect(await nftValueProvider.getNFTValueETH(0)).to.equal(floor);
     });
 
     it("should allow the owner to set an nft type and its multiplier", async () => {
-        await expect(
-            nftValueProvider.connect(user).setNFTType([0], apeHash)
-        ).to.be.revertedWith("Ownable: caller is not the owner");
+        await expect(nftValueProvider.connect(user).setNFTType([0], apeHash)).to
+            .be.reverted;
         await expect(
             nftValueProvider.connect(user).setNFTTypeMultiplier(apeHash, {
                 numerator: 10,
                 denominator: 1
             })
-        ).to.be.revertedWith("Ownable: caller is not the owner");
+        ).to.be.reverted;
 
         await nftValueProvider.setNFTTypeMultiplier(apeHash, {
             numerator: 10,
@@ -130,10 +161,16 @@ describe("NFTValueProvider", () => {
     it("should return the correct credit and liquidation limits", async () => {
         expect(
             await nftValueProvider.getCreditLimitETH(owner.address, 0)
-        ).to.equal(units((50 * 32) / 100));
+        ).to.equal(
+            floor.mul(baseCreditLimitRate[0]).div(baseCreditLimitRate[1])
+        );
         expect(
             await nftValueProvider.getLiquidationLimitETH(owner.address, 0)
-        ).to.equal(units((50 * 33) / 100));
+        ).to.equal(
+            floor
+                .mul(baseLiquidationLimitRate[0])
+                .div(baseLiquidationLimitRate[1])
+        );
     });
 
     it("should increase credit and liquidation limits after staking cig", async () => {
@@ -143,20 +180,15 @@ describe("NFTValueProvider", () => {
         await erc721.connect(user).approve(cigStaking.address, 200);
         await cigStaking.connect(user).deposit(200);
 
-        const creditLimit = await nftValueProvider.getCreditLimitRate(
-            user.address,
-            0
-        );
-        expect(creditLimit[0].toNumber() / creditLimit[1].toNumber()).to.equal(
-            0.39
-        );
-        const liquidationLimit = await nftValueProvider.getLiquidationLimitRate(
-            user.address,
-            0
-        );
         expect(
-            liquidationLimit[0].toNumber() / liquidationLimit[1].toNumber()
-        ).to.equal(0.4);
+            await nftValueProvider.getCreditLimitRate(user.address, 0)
+        ).to.deep.equal(sumRates(baseCreditLimitRate, cigBoostRateIncrease));
+
+        expect(
+            await nftValueProvider.getLiquidationLimitRate(user.address, 0)
+        ).to.deep.equal(
+            sumRates(baseLiquidationLimitRate, cigBoostRateIncrease)
+        );
     });
 
     it("should decrease credit and liquidation limits after unstaking cig", async () => {
@@ -170,13 +202,19 @@ describe("NFTValueProvider", () => {
 
         expect(
             await nftValueProvider.getCreditLimitRate(user.address, 0)
-        ).to.deep.equal([bn(32), bn(100)]);
+        ).to.deep.equal([
+            bn(baseCreditLimitRate[0]),
+            bn(baseCreditLimitRate[1])
+        ]);
         expect(
             await nftValueProvider.getLiquidationLimitRate(user.address, 0)
-        ).to.deep.equal([bn(33), bn(100)]);
+        ).to.deep.equal([
+            bn(baseLiquidationLimitRate[0]),
+            bn(baseLiquidationLimitRate[1])
+        ]);
     });
 
-    it("should allow users to lock JPEG to unlock trait boosts", async () => {
+    it("should allow users to lock JPEG for trait boosts", async () => {
         const indexes = [100, 101, 102];
 
         await nftValueProvider.setNFTTypeMultiplier(apeHash, {
@@ -186,163 +224,652 @@ describe("NFTValueProvider", () => {
         await nftValueProvider.setNFTType(indexes, apeHash);
 
         await expect(
-            nftValueProvider.applyTraitBoost(indexes, [0, 0])
-        ).to.be.revertedWith("InvalidLength");
-        await expect(
-            nftValueProvider.applyTraitBoost(indexes, [0, 0, 0])
-        ).to.be.revertedWith("InvalidUnlockTime(0)");
-
-        const timestamp = (await ethers.provider.getBlock("latest")).timestamp;
+            nftValueProvider.applyTraitBoost([])
+        ).to.be.revertedWithCustomError(nftValueProvider, "InvalidLength");
 
         await expect(
-            nftValueProvider.applyTraitBoost([0], [timestamp + 1000])
-        ).to.be.revertedWith('InvalidNFTType("' + zeroHash + '")');
+            nftValueProvider.applyTraitBoost([0])
+        ).to.be.revertedWithCustomError(nftValueProvider, "InvalidNFTType");
 
-        await jpeg.mint(user.address, units(36000 * 3));
-        await jpeg
+        const jpegToLock = floor
+            .mul(10)
+            .sub(floor)
+            .mul(traitBoostLockRate[0])
+            .div(traitBoostLockRate[1])
+            .mul(units(1))
+            .div(nftTokenPrice);
+
+        expect(
+            await nftValueProvider.calculateTraitBoostLock(
+                apeHash,
+                nftTokenPrice
+            )
+        ).to.equal(jpegToLock);
+
+        await jpgdToken.mint(user.address, jpegToLock.mul(indexes.length));
+        await jpgdToken
             .connect(user)
-            .approve(nftValueProvider.address, units(36000 * 3));
+            .approve(nftValueProvider.address, jpegToLock.mul(indexes.length));
 
-        await nftValueProvider.connect(user).applyTraitBoost(
-            indexes,
-            [0, 0, 0].map(() => timestamp + 1000)
+        await nftValueProvider.connect(user).applyTraitBoost(indexes);
+
+        await expect(
+            nftValueProvider.connect(user).applyTraitBoost(indexes)
+        ).to.be.revertedWithCustomError(nftValueProvider, "LockExists");
+
+        await expect(
+            nftValueProvider.applyTraitBoost(indexes)
+        ).to.be.revertedWithCustomError(nftValueProvider, "LockExists");
+
+        expect(
+            await Promise.all(
+                indexes.map(i => nftValueProvider.traitBoostPositions(i))
+            )
+        ).to.deep.equal(
+            new Array(indexes.length).fill([
+                user.address,
+                bn(0),
+                jpegToLock,
+                true
+            ])
         );
 
-        expect(await nftValueProvider.getNFTValueETH(indexes[0])).to.equal(
-            units(500)
-        );
+        expect(
+            await Promise.all(
+                indexes.map(i => nftValueProvider.getNFTValueETH(i))
+            )
+        ).to.deep.equal(new Array(indexes.length).fill(floor.mul(10)));
 
-        expect(await jpeg.balanceOf(user.address)).to.equal(0);
-        expect(await jpeg.balanceOf(nftValueProvider.address)).to.equal(
-            units(36000 * 3)
+        expect(await jpgdToken.balanceOf(user.address)).to.equal(0);
+        expect(await jpgdToken.balanceOf(nftValueProvider.address)).to.equal(
+            jpegToLock.mul(indexes.length)
         );
 
         await expect(
             nftValueProvider.withdrawTraitBoost(indexes)
-        ).to.be.revertedWith("Unauthorized()");
+        ).to.be.revertedWithCustomError(nftValueProvider, "Unauthorized");
         await expect(
             nftValueProvider.connect(user).withdrawTraitBoost(indexes)
-        ).to.be.revertedWith("Unauthorized()");
+        ).to.be.revertedWithCustomError(nftValueProvider, "Unauthorized");
+    });
 
-        await timeTravel(1000);
+    it("should allow users to lock JPEG for LTV boosts", async () => {
+        const indexes = [100, 101, 102];
+        const rateIncreases = [1000, 500, 250];
 
-        expect(await nftValueProvider.getNFTValueETH(indexes[0])).to.equal(
-            units(50)
+        const boostedCreditLimitRates = rateIncreases.map(r =>
+            sumRates([r, 10_000], baseCreditLimitRate)
         );
-        expect(await nftValueProvider.getNFTValueETH(indexes[1])).to.equal(
-            units(50)
+        const boostedLiquidationLimitRates = rateIncreases.map(r =>
+            sumRates([r, 10_000], baseLiquidationLimitRate)
         );
-        expect(await nftValueProvider.getNFTValueETH(indexes[2])).to.equal(
-            units(50)
+
+        const jpegAmounts = boostedCreditLimitRates.map(b => {
+            const baseCreditLimit = floor
+                .mul(baseCreditLimitRate[0])
+                .div(baseCreditLimitRate[1]);
+
+            const boostedCreditLimit = floor.mul(b[0]).div(b[1]);
+
+            return boostedCreditLimit
+                .sub(baseCreditLimit)
+                .mul(ltvBoostLockRate[0])
+                .div(ltvBoostLockRate[1])
+                .mul(units(1))
+                .div(nftTokenPrice);
+        });
+
+        const totalJpegAmount = jpegAmounts.reduce((p, c) => p.add(c));
+
+        expect(
+            await Promise.all(
+                rateIncreases.map(r =>
+                    nftValueProvider.calculateLTVBoostLock(nftTokenPrice, r)
+                )
+            )
+        ).to.deep.equal(jpegAmounts);
+
+        await expect(
+            nftValueProvider.applyLTVBoost(indexes, [0])
+        ).to.be.revertedWithCustomError(nftValueProvider, "InvalidLength");
+        await expect(
+            nftValueProvider.applyLTVBoost(indexes, [0, 0, 0])
+        ).to.be.revertedWithCustomError(nftValueProvider, "InvalidAmount");
+        await expect(
+            nftValueProvider.applyLTVBoost(indexes, [11000, 0, 0])
+        ).to.be.revertedWithCustomError(nftValueProvider, "InvalidAmount");
+        await expect(
+            nftValueProvider.applyLTVBoost(indexes, [3000, 0, 0])
+        ).to.be.revertedWithCustomError(nftValueProvider, "InvalidRate");
+
+        await jpgdToken.mint(user.address, totalJpegAmount);
+        await jpgdToken
+            .connect(user)
+            .approve(nftValueProvider.address, totalJpegAmount);
+
+        await nftValueProvider
+            .connect(user)
+            .applyLTVBoost(indexes, rateIncreases);
+
+        await expect(
+            nftValueProvider.connect(user).applyLTVBoost(indexes, rateIncreases)
+        ).to.be.revertedWithCustomError(nftValueProvider, "LockExists");
+
+        await expect(
+            nftValueProvider.applyLTVBoost(indexes, rateIncreases)
+        ).to.be.revertedWithCustomError(nftValueProvider, "LockExists");
+
+        expect(
+            await Promise.all(
+                indexes.map(i => nftValueProvider.ltvBoostPositions(i))
+            )
+        ).to.deep.equal(jpegAmounts.map(a => [user.address, bn(0), a, true]));
+
+        expect(
+            await Promise.all(
+                indexes.map(i =>
+                    nftValueProvider.getCreditLimitRate(user.address, i)
+                )
+            )
+        ).to.deep.equal(boostedCreditLimitRates);
+
+        expect(
+            await Promise.all(
+                indexes.map(i =>
+                    nftValueProvider.getLiquidationLimitRate(user.address, i)
+                )
+            )
+        ).to.deep.equal(boostedLiquidationLimitRates);
+
+        expect(await jpgdToken.balanceOf(user.address)).to.equal(0);
+        expect(await jpgdToken.balanceOf(nftValueProvider.address)).to.equal(
+            totalJpegAmount
         );
+
+        await expect(
+            nftValueProvider.connect(user).withdrawLTVBoost(indexes)
+        ).to.be.revertedWithCustomError(nftValueProvider, "Unauthorized");
+
+        await expect(
+            nftValueProvider.withdrawLTVBoost(indexes)
+        ).to.be.revertedWithCustomError(nftValueProvider, "Unauthorized");
+    });
+
+    it("should allow increasing LTV locks", async () => {
+        const indexes = [100, 101, 102];
+
+        const rateIncreases = [
+            ltvBoostMaxRateIncrease[0],
+            ltvBoostMaxRateIncrease[0] / 2,
+            ltvBoostMaxRateIncrease[0] / 4
+        ];
+
+        const jpegAmounts = await Promise.all(
+            rateIncreases.map(r =>
+                nftValueProvider.calculateLTVBoostLock(nftTokenPrice, r)
+            )
+        );
+
+        let totalJpegAmount = jpegAmounts.reduce((p, c) => p.add(c));
+
+        await jpgdToken.mint(user.address, totalJpegAmount);
+        await jpgdToken
+            .connect(user)
+            .approve(nftValueProvider.address, totalJpegAmount);
+
+        await nftValueProvider
+            .connect(user)
+            .applyLTVBoost(indexes, rateIncreases);
+
+        await expect(
+            nftValueProvider.connect(user).applyLTVBoost(indexes, rateIncreases)
+        ).to.be.revertedWithCustomError(nftValueProvider, "LockExists");
+
+        let newIncreases = rateIncreases.map(r => r * 2);
+
+        await expect(
+            nftValueProvider.connect(user).applyLTVBoost(indexes, newIncreases)
+        ).to.be.revertedWithCustomError(nftValueProvider, "InvalidRate");
+
+        newIncreases = newIncreases.slice(1);
+
+        const newJpegAmount = jpegAmounts.slice(1).reduce((p, c) => p.add(c));
+
+        await jpgdToken.mint(user.address, newJpegAmount);
+        await jpgdToken
+            .connect(user)
+            .approve(nftValueProvider.address, newJpegAmount);
+
+        await nftValueProvider
+            .connect(user)
+            .applyLTVBoost(indexes.slice(1), newIncreases);
+
+        expect(
+            await Promise.all(
+                indexes
+                    .slice(1)
+                    .map(i =>
+                        nftValueProvider.getCreditLimitRate(user.address, i)
+                    )
+            )
+        ).to.deep.equal(
+            newIncreases.map(r => sumRates([r, 10_000], baseCreditLimitRate))
+        );
+
+        expect(await jpgdToken.balanceOf(user.address)).to.equal(0);
+
+        await nftTokenOracle.updateAnswer(nftTokenPrice.mul(4));
+
+        await expect(
+            nftValueProvider
+                .connect(user)
+                .applyLTVBoost([indexes[1]], [newIncreases[0] * 2])
+        ).to.be.revertedWithCustomError(nftValueProvider, "InvalidRate");
+
+        await expect(
+            nftValueProvider.applyLTVBoost([indexes[2]], [newIncreases[1] * 2])
+        ).to.be.revertedWithCustomError(nftValueProvider, "LockExists");
+
+        await nftValueProvider
+            .connect(user)
+            .applyLTVBoost([indexes[2]], [newIncreases[1] * 2]);
+
+        expect(
+            await nftValueProvider.getCreditLimitRate(user.address, indexes[1])
+        ).to.deep.equal(
+            sumRates([newIncreases[1] * 2, 10_000], baseCreditLimitRate)
+        );
+    });
+
+    it("should allow queueing releases for trait boost locks", async () => {
+        const indexes = [100, 101, 102];
+
+        await nftValueProvider.setNFTTypeMultiplier(apeHash, {
+            numerator: 10,
+            denominator: 1
+        });
+        await nftValueProvider.setNFTType(indexes, apeHash);
+
+        const jpegAmounts = await Promise.all(
+            indexes.map(() =>
+                nftValueProvider.calculateTraitBoostLock(apeHash, nftTokenPrice)
+            )
+        );
+
+        const totalJpegAmount = jpegAmounts.reduce((p, c) => p.add(c));
+
+        await jpgdToken.mint(user.address, totalJpegAmount);
+        await jpgdToken
+            .connect(user)
+            .approve(nftValueProvider.address, totalJpegAmount);
+
+        await nftValueProvider.connect(user).applyTraitBoost(indexes);
+
+        await expect(
+            nftValueProvider.queueTraitBoostRelease(indexes)
+        ).to.be.revertedWithCustomError(nftValueProvider, "Unauthorized");
+
+        const startTimestamp = (await currentTimestamp()) + 1;
+        await setNextTimestamp(startTimestamp);
+
+        await nftValueProvider.connect(user).queueTraitBoostRelease(indexes);
+
+        await expect(
+            nftValueProvider.connect(user).queueTraitBoostRelease(indexes)
+        ).to.be.revertedWithCustomError(nftValueProvider, "Unauthorized");
+
+        expect(
+            await Promise.all(
+                indexes.map(i => nftValueProvider.traitBoostPositions(i))
+            )
+        ).to.deep.equal(
+            jpegAmounts.map(a => [
+                user.address,
+                bn(startTimestamp + locksReleaseDelay),
+                a,
+                true
+            ])
+        );
+
+        await expect(
+            nftValueProvider.connect(user).withdrawTraitBoost(indexes)
+        ).to.be.revertedWithCustomError(nftValueProvider, "Unauthorized");
+
+        expect(
+            await Promise.all(
+                indexes.map(i => nftValueProvider.getNFTValueETH(i))
+            )
+        ).to.deep.equal(new Array(indexes.length).fill(floor.mul(10)));
+
+        await timeTravel(locksReleaseDelay);
+
+        expect(
+            await Promise.all(
+                indexes.map(i => nftValueProvider.getNFTValueETH(i))
+            )
+        ).to.deep.equal(new Array(indexes.length).fill(floor));
 
         await nftValueProvider
             .connect(user)
             .withdrawTraitBoost(indexes.slice(1));
 
-        expect(await jpeg.balanceOf(user.address)).to.equal(units(36000 * 2));
-        expect(await jpeg.balanceOf(nftValueProvider.address)).to.equal(
-            units(36000)
+        expect(await jpgdToken.balanceOf(user.address)).to.equal(
+            totalJpegAmount.sub(jpegAmounts[0])
+        );
+        expect(await jpgdToken.balanceOf(nftValueProvider.address)).to.equal(
+            jpegAmounts[0]
         );
     });
 
-    it("should allow users to lock JPEG to unlock LTV boosts", async () => {
+    it("should allow queueing releases for LTV boost locks", async () => {
         const indexes = [100, 101, 102];
         const rateIncreases = [1000, 500, 250];
-        await expect(
-            nftValueProvider.applyLTVBoost(indexes, [0, 0], rateIncreases)
-        ).to.be.revertedWith("InvalidLength");
-        await expect(
-            nftValueProvider.applyLTVBoost(indexes, [0, 0, 0], rateIncreases)
-        ).to.be.revertedWith("InvalidUnlockTime(0)");
-        await expect(
-            nftValueProvider.applyLTVBoost(indexes, [0, 0, 0], [0, 0, 0])
-        ).to.be.revertedWith("InvalidAmount(0)");
-        await expect(
-            nftValueProvider.applyLTVBoost(indexes, [0, 0, 0], [11000, 0, 0])
-        ).to.be.revertedWith("InvalidAmount(11000)");
-        await expect(
-            nftValueProvider.applyLTVBoost(indexes, [0, 0, 0], [3000, 0, 0])
-        ).to.be.revertedWith("InvalidRate([3000, 10000])");
 
-        const jpegAmount = units(500 + 250 + 125);
-        await jpeg.mint(user.address, jpegAmount);
-        await jpeg.connect(user).approve(nftValueProvider.address, jpegAmount);
-
-        const timestamp = (await ethers.provider.getBlock("latest")).timestamp;
-
-        await nftValueProvider.connect(user).applyLTVBoost(
-            indexes,
-            [0, 0, 0].map(() => timestamp + 1000),
-            rateIncreases
+        const jpegAmounts = await Promise.all(
+            rateIncreases.map(r =>
+                nftValueProvider.calculateLTVBoostLock(nftTokenPrice, r)
+            )
         );
 
-        let creditLimitRate = await nftValueProvider.getCreditLimitRate(
-            user.address,
-            indexes[0]
-        );
-        expect(
-            creditLimitRate[0].toNumber() / creditLimitRate[1].toNumber()
-        ).to.equal(0.42);
-        let liquidationLimitRate =
-            await nftValueProvider.getLiquidationLimitRate(
-                user.address,
-                indexes[0]
-            );
-        expect(
-            liquidationLimitRate[0].toNumber() /
-                liquidationLimitRate[1].toNumber()
-        ).to.equal(0.43);
+        const totalJpegAmount = jpegAmounts.reduce((p, c) => p.add(c));
 
-        expect(await jpeg.balanceOf(user.address)).to.equal(0);
-        expect(await jpeg.balanceOf(nftValueProvider.address)).to.equal(
-            jpegAmount
-        );
-
-        await expect(
-            nftValueProvider.withdrawLTVBoost(indexes)
-        ).to.be.revertedWith("Unauthorized()");
-        await expect(
-            nftValueProvider.connect(user).withdrawLTVBoost(indexes)
-        ).to.be.revertedWith("Unauthorized()");
-
-        await timeTravel(1000);
-
-        creditLimitRate = await nftValueProvider.getCreditLimitRate(
-            user.address,
-            indexes[0]
-        );
-        expect(
-            creditLimitRate[0].toNumber() / creditLimitRate[1].toNumber()
-        ).to.equal(0.32);
-        liquidationLimitRate = await nftValueProvider.getLiquidationLimitRate(
-            user.address,
-            indexes[0]
-        );
-        expect(
-            liquidationLimitRate[0].toNumber() /
-                liquidationLimitRate[1].toNumber()
-        ).to.equal(0.33);
-
-        await nftValueProvider.connect(user).withdrawLTVBoost(indexes.slice(1));
-
-        expect(await jpeg.balanceOf(user.address)).to.equal(units(250 + 125));
-        expect(await jpeg.balanceOf(nftValueProvider.address)).to.equal(
-            units(500)
-        );
-    });
-
-    it("should apply both LTV and cig boosts to the same NFT", async () => {
-        const indexes = [100];
-
-        await jpeg.mint(user.address, units(500));
-        await jpeg.connect(user).approve(nftValueProvider.address, units(500));
-
-        const timestamp = (await ethers.provider.getBlock("latest")).timestamp;
+        await jpgdToken.mint(user.address, totalJpegAmount);
+        await jpgdToken
+            .connect(user)
+            .approve(nftValueProvider.address, totalJpegAmount);
 
         await nftValueProvider
             .connect(user)
-            .applyLTVBoost(indexes, [timestamp + 1000], [1000]);
+            .applyLTVBoost(indexes, rateIncreases);
+
+        let creditLimitRates = await Promise.all(
+            indexes.map(i =>
+                nftValueProvider.getCreditLimitRate(user.address, i)
+            )
+        );
+        let liquidationLimitRates = await Promise.all(
+            indexes.map(i =>
+                nftValueProvider.getLiquidationLimitRate(user.address, i)
+            )
+        );
+
+        await expect(
+            nftValueProvider.queueLTVBoostRelease(indexes)
+        ).to.be.revertedWithCustomError(nftValueProvider, "Unauthorized");
+
+        const startTimestamp = (await currentTimestamp()) + 1;
+        await setNextTimestamp(startTimestamp);
+
+        await nftValueProvider.connect(user).queueLTVBoostRelease(indexes);
+
+        await expect(
+            nftValueProvider.connect(user).queueLTVBoostRelease(indexes)
+        ).to.be.revertedWithCustomError(nftValueProvider, "Unauthorized");
+
+        expect(
+            await Promise.all(
+                indexes.map(i =>
+                    nftValueProvider.ltvBoostPositions(i).then(l => l.unlockAt)
+                )
+            )
+        ).to.deep.equal(
+            new Array(indexes.length).fill(
+                bn(startTimestamp + locksReleaseDelay)
+            )
+        );
+
+        await expect(
+            nftValueProvider.connect(user).withdrawLTVBoost(indexes)
+        ).to.be.revertedWithCustomError(nftValueProvider, "Unauthorized");
+
+        expect(
+            await Promise.all(
+                indexes.map(i =>
+                    nftValueProvider.getCreditLimitRate(user.address, i)
+                )
+            )
+        ).to.deep.equal(creditLimitRates);
+
+        expect(
+            await Promise.all(
+                indexes.map(i =>
+                    nftValueProvider.getLiquidationLimitRate(user.address, i)
+                )
+            )
+        ).to.deep.equal(liquidationLimitRates);
+
+        await expect(
+            nftValueProvider.applyLTVBoost(indexes, rateIncreases)
+        ).to.be.revertedWithCustomError(nftValueProvider, "LockExists");
+
+        await timeTravel(locksReleaseDelay);
+
+        expect(
+            await Promise.all(
+                indexes.map(i =>
+                    nftValueProvider.getCreditLimitRate(user.address, i)
+                )
+            )
+        ).to.deep.equal(
+            new Array(indexes.length).fill(baseCreditLimitRate.map(n => bn(n)))
+        );
+
+        expect(
+            await Promise.all(
+                indexes.map(i =>
+                    nftValueProvider.getLiquidationLimitRate(user.address, i)
+                )
+            )
+        ).to.deep.equal(
+            new Array(indexes.length).fill(
+                baseLiquidationLimitRate.map(n => bn(n))
+            )
+        );
+
+        await nftValueProvider.connect(user).withdrawLTVBoost(indexes.slice(1));
+
+        expect(await jpgdToken.balanceOf(user.address)).to.equal(
+            totalJpegAmount.sub(jpegAmounts[0])
+        );
+        expect(await jpgdToken.balanceOf(nftValueProvider.address)).to.equal(
+            jpegAmounts[0]
+        );
+    });
+
+    it("should allow cancelling queued releases for trait boost locks", async () => {
+        const indexes = [100, 101, 102];
+
+        await nftValueProvider.setNFTTypeMultiplier(apeHash, {
+            numerator: 10,
+            denominator: 1
+        });
+        await nftValueProvider.setNFTType(indexes, apeHash);
+
+        const jpegAmounts = await Promise.all(
+            indexes.map(() =>
+                nftValueProvider.calculateTraitBoostLock(apeHash, nftTokenPrice)
+            )
+        );
+
+        const totalJpegAmount = jpegAmounts.reduce((p, c) => p.add(c));
+
+        await jpgdToken.mint(user.address, totalJpegAmount);
+        await jpgdToken
+            .connect(user)
+            .approve(nftValueProvider.address, totalJpegAmount);
+
+        await nftValueProvider.connect(user).applyTraitBoost(indexes);
+
+        await expect(
+            nftValueProvider.connect(user).cancelTraitBoostRelease(indexes)
+        ).to.be.revertedWithCustomError(nftValueProvider, "Unauthorized");
+
+        await nftValueProvider.connect(user).queueTraitBoostRelease(indexes);
+
+        await nftValueProvider.connect(user).cancelTraitBoostRelease(indexes);
+
+        await expect(
+            nftValueProvider.connect(user).cancelTraitBoostRelease(indexes)
+        ).to.be.revertedWithCustomError(nftValueProvider, "Unauthorized");
+
+        expect(
+            await Promise.all(
+                indexes.map(i => nftValueProvider.traitBoostPositions(i))
+            )
+        ).to.deep.equal(jpegAmounts.map(a => [user.address, bn(0), a, true]));
+
+        expect(
+            await Promise.all(
+                indexes.map(i => nftValueProvider.getNFTValueETH(i))
+            )
+        ).to.deep.equal(new Array(indexes.length).fill(floor.mul(10)));
+
+        await expect(
+            nftValueProvider.connect(user).withdrawTraitBoost(indexes)
+        ).to.be.revertedWithCustomError(nftValueProvider, "Unauthorized");
+
+        await nftValueProvider.connect(user).queueTraitBoostRelease(indexes);
+
+        await timeTravel(locksReleaseDelay);
+
+        await expect(
+            nftValueProvider.connect(user).cancelTraitBoostRelease(indexes)
+        ).to.be.revertedWithCustomError(nftValueProvider, "Unauthorized");
+
+        expect(
+            await Promise.all(
+                indexes.map(i => nftValueProvider.getNFTValueETH(i))
+            )
+        ).to.deep.equal(new Array(indexes.length).fill(floor));
+
+        await nftValueProvider
+            .connect(user)
+            .withdrawTraitBoost(indexes.slice(1));
+
+        expect(await jpgdToken.balanceOf(user.address)).to.equal(
+            totalJpegAmount.sub(jpegAmounts[0])
+        );
+        expect(await jpgdToken.balanceOf(nftValueProvider.address)).to.equal(
+            jpegAmounts[0]
+        );
+    });
+
+    it("should allow cancelling queued releases for ltv boost locks", async () => {
+        const indexes = [100, 101, 102];
+        const rateIncreases = [1000, 500, 250];
+
+        const jpegAmounts = await Promise.all(
+            rateIncreases.map(r =>
+                nftValueProvider.calculateLTVBoostLock(nftTokenPrice, r)
+            )
+        );
+
+        const totalJpegAmount = jpegAmounts.reduce((p, c) => p.add(c));
+
+        await jpgdToken.mint(user.address, totalJpegAmount);
+        await jpgdToken
+            .connect(user)
+            .approve(nftValueProvider.address, totalJpegAmount);
+
+        await nftValueProvider
+            .connect(user)
+            .applyLTVBoost(indexes, rateIncreases);
+
+        await expect(
+            nftValueProvider.connect(user).cancelLTVBoostRelease(indexes)
+        ).to.be.revertedWithCustomError(nftValueProvider, "Unauthorized");
+
+        await nftValueProvider.connect(user).queueLTVBoostRelease(indexes);
+
+        await nftValueProvider.connect(user).cancelLTVBoostRelease(indexes);
+
+        expect(
+            await Promise.all(
+                indexes.map(i => nftValueProvider.ltvBoostPositions(i))
+            )
+        ).to.deep.equal(jpegAmounts.map(a => [user.address, bn(0), a, true]));
+
+        expect(
+            await Promise.all(
+                indexes.map(i =>
+                    nftValueProvider.getCreditLimitRate(user.address, i)
+                )
+            )
+        ).to.deep.equal(
+            rateIncreases.map(r => sumRates([r, 10_000], baseCreditLimitRate))
+        );
+
+        expect(
+            await Promise.all(
+                indexes.map(i =>
+                    nftValueProvider.getLiquidationLimitRate(user.address, i)
+                )
+            )
+        ).to.deep.equal(
+            rateIncreases.map(r =>
+                sumRates([r, 10_000], baseLiquidationLimitRate)
+            )
+        );
+
+        await expect(
+            nftValueProvider.connect(user).withdrawLTVBoost(indexes)
+        ).to.be.revertedWithCustomError(nftValueProvider, "Unauthorized");
+
+        await nftValueProvider.connect(user).queueLTVBoostRelease(indexes);
+
+        await timeTravel(locksReleaseDelay);
+
+        expect(
+            await Promise.all(
+                indexes.map(i =>
+                    nftValueProvider.getCreditLimitRate(user.address, i)
+                )
+            )
+        ).to.deep.equal(
+            new Array(indexes.length).fill(baseCreditLimitRate.map(n => bn(n)))
+        );
+
+        expect(
+            await Promise.all(
+                indexes.map(i =>
+                    nftValueProvider.getLiquidationLimitRate(user.address, i)
+                )
+            )
+        ).to.deep.equal(
+            new Array(indexes.length).fill(
+                baseLiquidationLimitRate.map(n => bn(n))
+            )
+        );
+
+        await nftValueProvider.connect(user).withdrawLTVBoost(indexes.slice(1));
+
+        expect(await jpgdToken.balanceOf(user.address)).to.equal(
+            totalJpegAmount.sub(jpegAmounts[0])
+        );
+        expect(await jpgdToken.balanceOf(nftValueProvider.address)).to.equal(
+            jpegAmounts[0]
+        );
+    });
+
+    it("should apply both LTV and cig boosts to the same JPGD", async () => {
+        const indexes = [100, 101, 102];
+        const rateIncreases = [2000, 1000, 500];
+
+        const jpegAmounts = await Promise.all(
+            rateIncreases.map(r =>
+                nftValueProvider.calculateLTVBoostLock(nftTokenPrice, r)
+            )
+        );
+
+        const totalJpegAmount = jpegAmounts.reduce((p, c) => p.add(c));
+        await jpgdToken.mint(user.address, totalJpegAmount);
+        await jpgdToken
+            .connect(user)
+            .approve(nftValueProvider.address, totalJpegAmount);
+
+        await nftValueProvider
+            .connect(user)
+            .applyLTVBoost(indexes, rateIncreases);
 
         await cigStaking.unpause();
 
@@ -350,232 +877,118 @@ describe("NFTValueProvider", () => {
         await erc721.connect(user).approve(cigStaking.address, 200);
         await cigStaking.connect(user).deposit(200);
 
-        let creditLimitRate = await nftValueProvider.getCreditLimitRate(
-            user.address,
-            indexes[0]
+        const creditLimitRates = await Promise.all(
+            indexes.map(i =>
+                nftValueProvider.getCreditLimitRate(user.address, i)
+            )
         );
-        expect(
-            creditLimitRate[0].toNumber() / creditLimitRate[1].toNumber()
-        ).to.equal(0.49);
-        let liquidationLimitRate =
-            await nftValueProvider.getLiquidationLimitRate(
-                user.address,
-                indexes[0]
-            );
-        expect(
-            liquidationLimitRate[0].toNumber() /
-                liquidationLimitRate[1].toNumber()
-        ).to.equal(0.5);
 
-        expect(await jpeg.balanceOf(user.address)).to.equal(0);
-        expect(await jpeg.balanceOf(nftValueProvider.address)).to.equal(
-            units(500)
+        const expectedCreditLimitRates = rateIncreases.map(r => {
+            const rate = sumRates(
+                [r, 10_000],
+                baseCreditLimitRate,
+                cigBoostRateIncrease
+            );
+
+            if (
+                rate[0]
+                    .mul(floor)
+                    .div(rate[1])
+                    .gt(floor.mul(ltvRateCap[0]).div(ltvRateCap[1]))
+            )
+                return [bn(ltvRateCap[0]), bn(ltvRateCap[1])];
+
+            return rate;
+        });
+
+        expect(creditLimitRates).to.deep.equal(expectedCreditLimitRates);
+
+        const liquidationLimitRates = await Promise.all(
+            indexes.map(i =>
+                nftValueProvider.getLiquidationLimitRate(user.address, i)
+            )
+        );
+
+        const expectedLiquidationLimitRates = rateIncreases.map(r => {
+            const rate = sumRates(
+                [r, 10_000],
+                baseLiquidationLimitRate,
+                cigBoostRateIncrease
+            );
+
+            if (
+                rate[0]
+                    .mul(floor)
+                    .div(rate[1])
+                    .gt(
+                        floor
+                            .mul(liquidationRateCap[0])
+                            .div(liquidationRateCap[1])
+                    )
+            )
+                return [bn(liquidationRateCap[0]), bn(liquidationRateCap[1])];
+
+            return rate;
+        });
+
+        expect(liquidationLimitRates).to.deep.equal(
+            expectedLiquidationLimitRates
+        );
+
+        expect(await jpgdToken.balanceOf(user.address)).to.equal(0);
+        expect(await jpgdToken.balanceOf(nftValueProvider.address)).to.equal(
+            totalJpegAmount
         );
     });
 
-    it("should allow users to override trait locks", async () => {
-        const indexes = [100, 101, 102];
+    it("should delete locks and burn jpgdToken when calling onLiquidation", async () => {
+        const nftIndex = 100;
+        const rateIncrease = 2000;
 
         await nftValueProvider.setNFTTypeMultiplier(apeHash, {
             numerator: 10,
             denominator: 1
         });
-        await nftValueProvider.setNFTType(indexes, apeHash);
+        await nftValueProvider.setNFTType([nftIndex], apeHash);
 
-        await jpeg.mint(user.address, units(90000));
-        await jpeg
-            .connect(user)
-            .approve(nftValueProvider.address, units(720000));
-
-        const timestamp = (await ethers.provider.getBlock("latest")).timestamp;
-        await nftValueProvider
-            .connect(user)
-            .applyTraitBoost([indexes[0]], [timestamp + 1000]);
-
-        expect(await jpeg.balanceOf(user.address)).to.equal(units(54000));
-        expect(await jpeg.balanceOf(nftValueProvider.address)).to.equal(
-            units(36000)
-        );
-
-        await jpegOracle.setPrice(2000000000000000);
-
-        await expect(
-            nftValueProvider
-                .connect(user)
-                .applyTraitBoost([indexes[0]], [timestamp + 1000])
-        ).to.be.revertedWith("InvalidUnlockTime(" + (timestamp + 1000) + ")");
-
-        await nftValueProvider.connect(user).applyTraitBoost(
-            indexes,
-            [0, 0, 0].map(() => timestamp + 1001)
-        );
-
-        expect(await jpeg.balanceOf(user.address)).to.equal(units(18000));
-        expect(await jpeg.balanceOf(nftValueProvider.address)).to.equal(
-            units(72000)
-        );
-
-        await jpegOracle.setPrice(1000000000000000);
-
-        await nftValueProvider
-            .connect(user)
-            .applyTraitBoost([indexes[0]], [timestamp + 1002]);
-        expect(await jpeg.balanceOf(user.address)).to.equal(units(18000));
-        expect(await jpeg.balanceOf(nftValueProvider.address)).to.equal(
-            units(72000)
-        );
-
-        await nftValueProvider
-            .connect(user)
-            .applyTraitBoost([indexes[1]], [timestamp + 1002]);
-
-        expect(await jpeg.balanceOf(user.address)).to.equal(0);
-        expect(await jpeg.balanceOf(nftValueProvider.address)).to.equal(
-            units(90000)
-        );
-
-        await jpeg.mint(owner.address, units(36000));
-        await jpeg.approve(nftValueProvider.address, units(36000));
-
-        await nftValueProvider.applyTraitBoost(
-            [indexes[2]],
-            [0].map(() => timestamp + 1003)
-        );
-
-        expect(await jpeg.balanceOf(user.address)).to.equal(units(18000));
-        expect(await jpeg.balanceOf(nftValueProvider.address)).to.equal(
-            units(108000)
-        );
-        expect(await jpeg.balanceOf(owner.address)).to.equal(units(1000000000));
-
-        await jpegOracle.setPrice(2000000000000000);
-        await timeTravel(2000);
-
-        await nftValueProvider.connect(user).applyTraitBoost(
-            indexes,
-            [0, 0, 0].map(() => timestamp + 3003)
-        );
-        expect(await jpeg.balanceOf(user.address)).to.equal(units(36000));
-        expect(await jpeg.balanceOf(nftValueProvider.address)).to.equal(
-            units(54000)
-        );
-        expect(await jpeg.balanceOf(owner.address)).to.equal(units(1000036000));
-    });
-
-    it("should allow users to override ltv locks", async () => {
-        const indexes = [100, 101, 102];
-        const rateIncreases = [1000, 500, 250];
-
-        await jpeg.mint(user.address, units(500 + 250 + 125));
-        await jpeg
-            .connect(user)
-            .approve(nftValueProvider.address, units(720000));
-
-        const timestamp = (await ethers.provider.getBlock("latest")).timestamp;
-        await nftValueProvider
-            .connect(user)
-            .applyLTVBoost(
-                [indexes[0]],
-                [timestamp + 1000],
-                [rateIncreases[0]]
+        const jpegAmount = await nftValueProvider
+            .calculateLTVBoostLock(nftTokenPrice, rateIncrease)
+            .then(a =>
+                nftValueProvider
+                    .calculateTraitBoostLock(apeHash, nftTokenPrice)
+                    .then(b => a.add(b))
             );
 
-        expect(await jpeg.balanceOf(user.address)).to.equal(units(250 + 125));
-        expect(await jpeg.balanceOf(nftValueProvider.address)).to.equal(
-            units(500)
-        );
-
-        await jpegOracle.setPrice(2000000000000000);
-
-        await expect(
-            nftValueProvider
-                .connect(user)
-                .applyLTVBoost(
-                    [indexes[0]],
-                    [timestamp + 1000],
-                    [rateIncreases[0]]
-                )
-        ).to.be.revertedWith("InvalidUnlockTime(" + (timestamp + 1000) + ")");
-        await expect(
-            nftValueProvider
-                .connect(user)
-                .applyLTVBoost(
-                    [indexes[0]],
-                    [timestamp + 1001],
-                    [rateIncreases[0] / 2]
-                )
-        ).to.be.revertedWith(
-            "InvalidRate([" + rateIncreases[0] / 2 + ", 10000])"
-        );
-
-        await nftValueProvider.connect(user).applyLTVBoost(
-            indexes,
-            [0, 0, 0].map(() => timestamp + 1001),
-            rateIncreases
-        );
-
-        expect(await jpeg.balanceOf(user.address)).to.equal(units(125 + 62.5));
-        expect(await jpeg.balanceOf(nftValueProvider.address)).to.equal(
-            units(500 + 125 + 62.5)
-        );
-
-        await jpegOracle.setPrice(1000000000000000);
+        await jpgdToken.mint(user.address, jpegAmount);
+        await jpgdToken
+            .connect(user)
+            .approve(nftValueProvider.address, jpegAmount);
 
         await nftValueProvider
             .connect(user)
-            .applyLTVBoost(
-                [indexes[0]],
-                [timestamp + 1002],
-                [rateIncreases[0]]
-            );
-        expect(await jpeg.balanceOf(user.address)).to.equal(units(125 + 62.5));
-        expect(await jpeg.balanceOf(nftValueProvider.address)).to.equal(
-            units(500 + 125 + 62.5)
-        );
+            .applyLTVBoost([nftIndex], [rateIncrease]);
+        await nftValueProvider.connect(user).applyTraitBoost([nftIndex]);
 
-        await nftValueProvider
-            .connect(user)
-            .applyLTVBoost(
-                [indexes[1]],
-                [timestamp + 1002],
-                [rateIncreases[1]]
-            );
+        await expect(nftValueProvider.onLiquidation(nftIndex)).to.be.reverted;
 
-        expect(await jpeg.balanceOf(user.address)).to.equal(units(62.5));
-        expect(await jpeg.balanceOf(nftValueProvider.address)).to.equal(
-            units(500 + 250 + 62.5)
+        await nftValueProvider.grantRole(
+            ethers.utils.solidityKeccak256(["string"], ["VAULT_ROLE"]),
+            owner.address
         );
+        await nftValueProvider.onLiquidation(nftIndex);
 
-        await jpeg.mint(owner.address, units(125));
-        await jpeg.approve(nftValueProvider.address, units(125));
-
-        await nftValueProvider.applyLTVBoost(
-            [indexes[2]],
-            [0].map(() => timestamp + 1003),
-            [rateIncreases[2]]
-        );
-
-        expect(await jpeg.balanceOf(user.address)).to.equal(units(125));
-        expect(await jpeg.balanceOf(nftValueProvider.address)).to.equal(
-            units(500 + 250 + 125)
-        );
-        expect(await jpeg.balanceOf(owner.address)).to.equal(units(1000000000));
-
-        await jpegOracle.setPrice(2000000000000000);
-        await timeTravel(2000);
-
-        await nftValueProvider.connect(user).applyLTVBoost(
-            indexes,
-            [0, 0, 0].map(() => timestamp + 3003),
-            rateIncreases
-        );
-        expect(await jpeg.balanceOf(user.address)).to.equal(
-            units(250 + 125 + 62.5)
-        );
-        expect(await jpeg.balanceOf(nftValueProvider.address)).to.equal(
-            units(250 + 125 + 62.5)
-        );
-        expect(await jpeg.balanceOf(owner.address)).to.equal(units(1000000125));
+        expect(
+            await jpgdToken.balanceOf(await nftValueProvider.BURN_ADDRESS())
+        ).to.equal(jpegAmount);
+        expect(
+            await nftValueProvider.traitBoostPositions(nftIndex)
+        ).to.have.property("owner", ZERO_ADDRESS);
+        expect(
+            await nftValueProvider.ltvBoostPositions(nftIndex)
+        ).to.have.property("owner", ZERO_ADDRESS);
+        expect(
+            await nftValueProvider.ltvBoostRateIncreases(nftIndex)
+        ).to.deep.equal([bn(0), bn(0)]);
     });
 
     it("should allow the owner to override floor price", async () => {
@@ -583,6 +996,225 @@ describe("NFTValueProvider", () => {
         expect(await nftValueProvider.getFloorETH()).to.equal(units(10));
         expect(await nftValueProvider.getNFTValueETH(0)).to.equal(units(10));
         await nftValueProvider.disableFloorOverride();
-        expect(await nftValueProvider.getNFTValueETH(0)).to.equal(units(50));
+        expect(await nftValueProvider.getNFTValueETH(0)).to.equal(floor);
+    });
+
+    describe("Token migration", () => {
+        let jpeg: JPEG;
+
+        beforeEach(async () => {
+            const JPEG = await ethers.getContractFactory("JPEG");
+
+            jpeg = await JPEG.deploy(0);
+            await jpeg.deployed();
+
+            await nftValueProvider.setJPEG(jpeg.address);
+
+            await jpeg.grantRole(minterRole, owner.address);
+        });
+
+        it("should release jpeg tokens when releasing a legacy trait lock", async () => {
+            const indexes = [100];
+
+            await nftValueProvider.setNFTTypeMultiplier(apeHash, {
+                numerator: 10,
+                denominator: 1
+            });
+            await nftValueProvider.setNFTType(indexes, apeHash);
+
+            const nftToLock = floor
+                .mul(10)
+                .sub(floor)
+                .mul(traitBoostLockRate[0])
+                .div(traitBoostLockRate[1])
+                .mul(units(1))
+                .div(nftTokenPrice);
+
+            await jpgdToken.mint(user.address, nftToLock.mul(indexes.length));
+            await jpgdToken
+                .connect(user)
+                .approve(
+                    nftValueProvider.address,
+                    nftToLock.mul(indexes.length)
+                );
+
+            await nftValueProvider.connect(user).applyTraitBoost(indexes);
+
+            await nftValueProvider.setLegacyTraitLock(100, nftToLock);
+            await jpeg.mint(nftValueProvider.address, nftToLock);
+
+            await jpgdToken
+                .connect(user)
+                .approve(
+                    nftValueProvider.address,
+                    nftToLock.mul(indexes.length)
+                );
+
+            await nftValueProvider.connect(user).queueTraitBoostRelease([100]);
+
+            await timeTravel(locksReleaseDelay);
+
+            await nftValueProvider.connect(user).withdrawTraitBoost(indexes);
+
+            expect(await jpgdToken.balanceOf(user.address)).to.equal(0);
+            expect(
+                await jpgdToken.balanceOf(nftValueProvider.address)
+            ).to.equal(nftToLock);
+            expect(await jpeg.balanceOf(user.address)).to.equal(nftToLock);
+            expect(await jpeg.balanceOf(nftValueProvider.address)).to.equal(0);
+        });
+
+        it("should release jpeg tokens and lock nft tokens when overriding a released legacy trait lock", async () => {
+            const indexes = [100];
+
+            await nftValueProvider.setNFTTypeMultiplier(apeHash, {
+                numerator: 10,
+                denominator: 1
+            });
+            await nftValueProvider.setNFTType(indexes, apeHash);
+
+            const nftToLock = floor
+                .mul(10)
+                .sub(floor)
+                .mul(traitBoostLockRate[0])
+                .div(traitBoostLockRate[1])
+                .mul(units(1))
+                .div(nftTokenPrice);
+
+            await jpgdToken.mint(user.address, nftToLock.mul(indexes.length));
+            await jpgdToken
+                .connect(user)
+                .approve(
+                    nftValueProvider.address,
+                    nftToLock.mul(indexes.length)
+                );
+
+            await nftValueProvider.connect(user).applyTraitBoost(indexes);
+
+            await nftValueProvider.setLegacyTraitLock(100, nftToLock);
+            await jpeg.mint(nftValueProvider.address, nftToLock);
+            await jpgdToken.mint(user.address, nftToLock.mul(indexes.length));
+
+            await jpgdToken
+                .connect(user)
+                .approve(
+                    nftValueProvider.address,
+                    nftToLock.mul(indexes.length)
+                );
+
+            await expect(
+                nftValueProvider.connect(user).applyTraitBoost(indexes)
+            ).to.be.revertedWithCustomError(nftValueProvider, "LockExists");
+
+            await nftValueProvider.connect(user).queueTraitBoostRelease([100]);
+
+            await timeTravel(locksReleaseDelay);
+
+            await nftValueProvider.connect(user).applyTraitBoost(indexes);
+
+            expect(await jpgdToken.balanceOf(user.address)).to.equal(0);
+            expect(
+                await jpgdToken.balanceOf(nftValueProvider.address)
+            ).to.equal(nftToLock.mul(2));
+            expect(await jpeg.balanceOf(user.address)).to.equal(nftToLock);
+            expect(await jpeg.balanceOf(nftValueProvider.address)).to.equal(0);
+
+            const traitBoost = await nftValueProvider.traitBoostPositions(100);
+
+            expect(traitBoost.isNewToken).to.be.true;
+            expect(traitBoost.lockedValue).to.equal(nftToLock);
+        });
+
+        it("should release jpeg tokens when releasing a legacy ltv lock", async () => {
+            const index = 100;
+            const rateIncrease = 500;
+
+            const nftToLock = await nftValueProvider.calculateLTVBoostLock(
+                nftTokenPrice,
+                rateIncrease
+            );
+
+            await jpgdToken.mint(user.address, nftToLock);
+            await jpgdToken
+                .connect(user)
+                .approve(nftValueProvider.address, nftToLock);
+
+            await nftValueProvider
+                .connect(user)
+                .applyLTVBoost([index], [rateIncrease]);
+
+            await nftValueProvider.setLegacyLTVLock(100, nftToLock);
+            await jpeg.mint(nftValueProvider.address, nftToLock);
+
+            await jpgdToken
+                .connect(user)
+                .approve(nftValueProvider.address, nftToLock);
+
+            await nftValueProvider.connect(user).queueLTVBoostRelease([100]);
+
+            await timeTravel(locksReleaseDelay);
+
+            await nftValueProvider.connect(user).withdrawLTVBoost([index]);
+
+            expect(await jpgdToken.balanceOf(user.address)).to.equal(0);
+            expect(
+                await jpgdToken.balanceOf(nftValueProvider.address)
+            ).to.equal(nftToLock);
+            expect(await jpeg.balanceOf(user.address)).to.equal(nftToLock);
+            expect(await jpeg.balanceOf(nftValueProvider.address)).to.equal(0);
+        });
+
+        it("should release jpeg tokens and lock nft tokens when overriding a legacy ltv lock", async () => {
+            const index = 100;
+            const rateIncrease = 500;
+
+            const nftToLock = await nftValueProvider.calculateLTVBoostLock(
+                nftTokenPrice,
+                rateIncrease
+            );
+
+            await jpgdToken.mint(user.address, nftToLock);
+            await jpgdToken
+                .connect(user)
+                .approve(nftValueProvider.address, nftToLock);
+
+            await nftValueProvider
+                .connect(user)
+                .applyLTVBoost([index], [rateIncrease]);
+
+            await nftValueProvider.setLegacyLTVLock(100, nftToLock);
+            await jpeg.mint(nftValueProvider.address, nftToLock);
+
+            await jpgdToken
+                .connect(user)
+                .approve(nftValueProvider.address, nftToLock);
+
+            await expect(
+                nftValueProvider
+                    .connect(user)
+                    .applyLTVBoost([index], [rateIncrease])
+            ).to.be.revertedWithCustomError(nftValueProvider, "LockExists");
+
+            await jpgdToken.mint(user.address, nftToLock.mul(2));
+            await jpgdToken
+                .connect(user)
+                .approve(nftValueProvider.address, nftToLock.mul(2));
+
+            await nftValueProvider
+                .connect(user)
+                .applyLTVBoost([index], [rateIncrease * 2]);
+
+            expect(await jpgdToken.balanceOf(user.address)).to.equal(0);
+            expect(
+                await jpgdToken.balanceOf(nftValueProvider.address)
+            ).to.equal(nftToLock.mul(3));
+            expect(await jpeg.balanceOf(user.address)).to.equal(nftToLock);
+            expect(await jpeg.balanceOf(nftValueProvider.address)).to.equal(0);
+
+            const traitBoost = await nftValueProvider.ltvBoostPositions(100);
+
+            expect(traitBoost.isNewToken).to.be.true;
+            expect(traitBoost.lockedValue).to.equal(nftToLock.mul(2));
+        });
     });
 });

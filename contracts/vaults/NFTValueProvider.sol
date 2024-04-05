@@ -1,43 +1,67 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity ^0.8.4;
 
-import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
+
+import "../utils/AccessControlUpgradeable.sol";
+import "../utils/RateLib.sol";
 
 import "../interfaces/IAggregatorV3Interface.sol";
 import "../interfaces/IUniswapV2Oracle.sol";
 import "../interfaces/IJPEGOraclesAggregator.sol";
 import "../interfaces/IJPEGCardsCigStaking.sol";
 
-contract NFTValueProvider is ReentrancyGuardUpgradeable, OwnableUpgradeable {
+contract NFTValueProvider is
+    ReentrancyGuardUpgradeable,
+    AccessControlUpgradeable
+{
+    using RateLib for RateLib.Rate;
     using SafeERC20Upgradeable for IERC20Upgradeable;
 
     error InvalidNFTType(bytes32 nftType);
-    error InvalidRate(Rate rate);
-    error InvalidUnlockTime(uint256 unlockTime);
-    error ExistingLock(uint256 index);
     error InvalidAmount(uint256 amount);
-    error InvalidOracleResults();
+    error LockExists(uint256 index);
     error Unauthorized();
     error ZeroAddress();
     error InvalidLength();
+    error InvalidOracleResults();
 
     event DaoFloorChanged(uint256 newFloor);
 
-    event TraitBoostLock(
+    event TraitBoost(
+        address indexed owner,
+        uint256 indexed index,
+        uint256 amount
+    );
+
+    event LTVBoost(
         address indexed owner,
         uint256 indexed index,
         uint256 amount,
+        uint128 rateIncreaseBps
+    );
+
+    event TraitBoostReleaseQueued(
+        address indexed owner,
+        uint256 indexed index,
         uint256 unlockTime
     );
 
-    event LTVBoostLock(
+    event LTVBoostReleaseQueued(
         address indexed owner,
         uint256 indexed index,
-        uint256 amount,
-        uint256 unlockTime,
-        uint128 rateIncreaseBps
+        uint256 unlockTime
+    );
+
+    event TraitBoostReleaseCancelled(
+        address indexed owner,
+        uint256 indexed index
+    );
+
+    event LTVBoostReleaseCancelled(
+        address indexed owner,
+        uint256 indexed index
     );
 
     event TraitBoostUnlock(
@@ -52,16 +76,29 @@ contract NFTValueProvider is ReentrancyGuardUpgradeable, OwnableUpgradeable {
         uint256 amount
     );
 
-    struct Rate {
-        uint128 numerator;
-        uint128 denominator;
-    }
+    event TraitBoostLiquidated(
+        address indexed owner,
+        uint256 indexed index,
+        uint256 amount
+    );
+
+    event LTVBoostLiquidated(
+        address indexed owner,
+        uint256 indexed index,
+        uint256 amount
+    );
 
     struct JPEGLock {
         address owner;
         uint256 unlockAt;
         uint256 lockedValue;
+        bool isNewToken;
     }
+
+    bytes32 public constant VAULT_ROLE = keccak256("VAULT_ROLE");
+
+    address public constant BURN_ADDRESS =
+        0x000000000000000000000000000000000000dEaD;
 
     /// @notice The JPEG floor oracles aggregator
     IJPEGOraclesAggregator public aggregator;
@@ -72,108 +109,139 @@ contract NFTValueProvider is ReentrancyGuardUpgradeable, OwnableUpgradeable {
     uint256 private overriddenFloorValueETH;
 
     /// @notice The JPEG token
+    /// Only needed for legacy locks on already existing vaults
     IERC20Upgradeable public jpeg;
-    /// @notice Value of the JPEG to lock for trait boost based on the NFT value increase
+    /// @notice Value of the $JPGD to lock for trait boost based on the NFT value increase
     /// @custom:oz-renamed-from valueIncreaseLockRate
-    Rate public traitBoostLockRate;
-    /// @notice Minimum amount of JPEG to lock for trait boost
-    uint256 public minJPEGToLock;
+    RateLib.Rate public traitBoostLockRate;
+    /// @notice Minimum amount of $JPGD to lock for trait boost
+    uint256 public minjpgdTokenToLock;
 
     mapping(uint256 => bytes32) public nftTypes;
-    mapping(bytes32 => Rate) public nftTypeValueMultiplier;
+    mapping(bytes32 => RateLib.Rate) public nftTypeValueMultiplier;
     /// @custom:oz-renamed-from lockPositions
     mapping(uint256 => JPEGLock) public traitBoostPositions;
     mapping(uint256 => JPEGLock) public ltvBoostPositions;
 
-    Rate public baseCreditLimitRate;
-    Rate public baseLiquidationLimitRate;
-    Rate public cigStakedRateIncrease;
-    /// @custom:oz-renamed-from jpegLockedRateIncrease
-    Rate public jpegLockedMaxRateIncrease;
+    RateLib.Rate public baseCreditLimitRate;
+    RateLib.Rate public baseLiquidationLimitRate;
+    RateLib.Rate public cigStakedRateIncrease;
+    /// @custom:oz-renamed-from nftLockedRateIncrease
+    RateLib.Rate public jpgdTokenLockedMaxRateIncrease;
 
-    /// @notice Value of the JPEG to lock for ltv boost based on the NFT ltv increase
-    Rate public ltvBoostLockRate;
+    /// @notice Value of the $JPGD to lock for ltv boost based on the NFT ltv increase
+    RateLib.Rate public ltvBoostLockRate;
 
     /// @notice JPEGCardsCigStaking, cig stakers get an higher credit limit rate and liquidation limit rate.
     /// Immediately reverts to normal rates if the cig is unstaked.
     IJPEGCardsCigStaking public cigStaking;
 
-    mapping(uint256 => Rate) public ltvBoostRateIncreases;
+    mapping(uint256 => RateLib.Rate) public ltvBoostRateIncreases;
+
+    RateLib.Rate public creditLimitRateCap;
+    RateLib.Rate public liquidationLimitRateCap;
+
+    uint256 public lockReleaseDelay;
+
+    /// @notice the $JPGD token
+    IERC20Upgradeable public jpgdToken;
+    /// @notice The price oracle for the $JPGD governance token
+    IAggregatorV3Interface public jpgdTokenOracle;
+
+    // only used in {initialize}
+    struct Rates {
+        RateLib.Rate baseCreditLimitRate; //The base credit limit rate
+        RateLib.Rate baseLiquidationLimitRate; //The base liquidation limit rate
+        RateLib.Rate cigStakedRateIncrease; //The liquidation and credit limit rate increases for users staking a cig in the cigStaking contract
+        RateLib.Rate jpgdTokenLockedMaxRateIncrease; //The maximum liquidation and credit limit rate increases for users that locked NFT for LTV boost
+        RateLib.Rate traitBoostLockRate; //The rate used to calculate the amount of $JPGD to lock for trait boost based on the NFT's value increase
+        RateLib.Rate ltvBoostLockRate; //The rate used to calculate the amount of $JPGD to lock for LTV boost based on the NFT's credit limit increase
+        RateLib.Rate creditLimitRateCap; //The maximum credit limit rate
+        RateLib.Rate liquidationLimitRateCap; //The maximum liquidation limit rate
+    }
 
     /// @notice This function is only called once during deployment of the proxy contract. It's not called after upgrades.
-    /// @param _jpeg The JPEG token
+    /// @param _jpgdToken The $JPGD token
+    /// @param _jpgdTokenOracle The price oracle for the $JPGD token
     /// @param _aggregator The JPEG floor oracles aggregator
     /// @param _cigStaking The cig staking address
-    /// @param _baseCreditLimitRate The base credit limit rate
-    /// @param _baseLiquidationLimitRate The base liquidation limit rate
-    /// @param _cigStakedRateIncrease The liquidation and credit limit rate increases for users staking a cig in the cigStaking contract
-    /// @param _jpegLockedMaxRateIncrease The maximum liquidation and credit limit rate increases for users that locked JPEG for LTV boost
-    /// @param _traitBoostLockRate The rate used to calculate the amount of JPEG to lock for trait boost based on the NFT's value increase
-    /// @param _ltvBoostLockRate The rate used to calculate the amount of JPEG to lock for LTV boost based on the NFT's credit limit increase
-    /// @param _minJPEGToLock Minimum amount of JPEG to lock to apply the trait boost
+    /// @param _rates See the {Rates} struct
+    /// @param _lockReleaseDelay the time delay between an unlock request and the actual unlock
     function initialize(
-        IERC20Upgradeable _jpeg,
+        IERC20Upgradeable _jpgdToken,
+        IAggregatorV3Interface _jpgdTokenOracle,
         IJPEGOraclesAggregator _aggregator,
         IJPEGCardsCigStaking _cigStaking,
-        Rate calldata _baseCreditLimitRate,
-        Rate calldata _baseLiquidationLimitRate,
-        Rate calldata _cigStakedRateIncrease,
-        Rate calldata _jpegLockedMaxRateIncrease,
-        Rate calldata _traitBoostLockRate,
-        Rate calldata _ltvBoostLockRate,
-        uint256 _minJPEGToLock
+        Rates calldata _rates,
+        uint256 _lockReleaseDelay
     ) external initializer {
-        __Ownable_init();
+        __AccessControl_init();
         __ReentrancyGuard_init();
 
-        if (address(_jpeg) == address(0)) revert ZeroAddress();
+        if (address(_jpgdToken) == address(0)) revert ZeroAddress();
+        if (address(_jpgdTokenOracle) == address(0)) revert ZeroAddress();
         if (address(_aggregator) == address(0)) revert ZeroAddress();
         if (address(_cigStaking) == address(0)) revert ZeroAddress();
 
-        _validateRateBelowOne(_baseCreditLimitRate);
-        _validateRateBelowOne(_baseLiquidationLimitRate);
-        _validateRateBelowOne(_cigStakedRateIncrease);
-        _validateRateBelowOne(_jpegLockedMaxRateIncrease);
-        _validateRateBelowOne(_traitBoostLockRate);
-        _validateRateBelowOne(_ltvBoostLockRate);
+        _validateRateBelowOne(_rates.baseCreditLimitRate);
+        _validateRateBelowOne(_rates.baseLiquidationLimitRate);
+        _validateRateBelowOne(_rates.cigStakedRateIncrease);
+        _validateRateBelowOne(_rates.jpgdTokenLockedMaxRateIncrease);
+        _validateRateBelowOne(_rates.traitBoostLockRate);
+        _validateRateBelowOne(_rates.ltvBoostLockRate);
+        _validateRateBelowOne(_rates.creditLimitRateCap);
+        _validateRateBelowOne(_rates.liquidationLimitRateCap);
 
-        if (!_greaterThan(_baseLiquidationLimitRate, _baseCreditLimitRate))
-            revert InvalidRate(_baseLiquidationLimitRate);
+        if (_rates.baseCreditLimitRate.greaterThan(_rates.creditLimitRateCap))
+            revert RateLib.InvalidRate();
 
-        _validateRateBelowOne(
-            _rateSum(
-                _rateSum(_baseLiquidationLimitRate, _cigStakedRateIncrease),
-                _jpegLockedMaxRateIncrease
+        if (
+            _rates.baseLiquidationLimitRate.greaterThan(
+                _rates.liquidationLimitRateCap
             )
-        );
+        ) revert RateLib.InvalidRate();
 
-        jpeg = _jpeg;
+        if (
+            !_rates.baseLiquidationLimitRate.greaterThan(
+                _rates.baseCreditLimitRate
+            )
+        ) revert RateLib.InvalidRate();
+
+        if (
+            !_rates.liquidationLimitRateCap.greaterThan(
+                _rates.creditLimitRateCap
+            )
+        ) revert RateLib.InvalidRate();
+
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+
+        jpgdToken = _jpgdToken;
+        jpgdTokenOracle = _jpgdTokenOracle;
         aggregator = _aggregator;
         cigStaking = _cigStaking;
-        baseCreditLimitRate = _baseCreditLimitRate;
-        baseLiquidationLimitRate = _baseLiquidationLimitRate;
-        cigStakedRateIncrease = _cigStakedRateIncrease;
-        jpegLockedMaxRateIncrease = _jpegLockedMaxRateIncrease;
-        traitBoostLockRate = _traitBoostLockRate;
-        ltvBoostLockRate = _ltvBoostLockRate;
-        minJPEGToLock = _minJPEGToLock;
+        baseCreditLimitRate = _rates.baseCreditLimitRate;
+        baseLiquidationLimitRate = _rates.baseLiquidationLimitRate;
+        cigStakedRateIncrease = _rates.cigStakedRateIncrease;
+        jpgdTokenLockedMaxRateIncrease = _rates.jpgdTokenLockedMaxRateIncrease;
+        traitBoostLockRate = _rates.traitBoostLockRate;
+        ltvBoostLockRate = _rates.ltvBoostLockRate;
+        creditLimitRateCap = _rates.creditLimitRateCap;
+        liquidationLimitRateCap = _rates.liquidationLimitRateCap;
+        lockReleaseDelay = _lockReleaseDelay;
+        minjpgdTokenToLock = 1 ether;
     }
 
     function finalizeUpgrade(
-        uint128 _maxRateIncreaseBps,
-        uint256[] memory _positionIndexes
+        address _jpgdToken,
+        address _jpgdTokenOracle
     ) external {
-        if (jpegLockedMaxRateIncrease.denominator == 10000) {
-            revert();
-        }
+        if (address(jpgdToken) != address(0)) revert();
 
-        jpegLockedMaxRateIncrease = Rate(_maxRateIncreaseBps, 10000);
+        if (_jpgdToken == address(0) || _jpgdTokenOracle == address(0))
+            revert ZeroAddress();
 
-        Rate memory _rate = Rate(1500, 10000);
-        uint256 _length = _positionIndexes.length;
-        for (uint256 i; i < _length; ++i) {
-            ltvBoostRateIncreases[_positionIndexes[i]] = _rate;
-        }
+        jpgdToken = IERC20Upgradeable(_jpgdToken);
+        jpgdTokenOracle = IAggregatorV3Interface(_jpgdTokenOracle);
     }
 
     /// @param _owner The owner of the NFT at index `_nftIndex` (or the owner of the associated position in the vault)
@@ -182,8 +250,14 @@ contract NFTValueProvider is ReentrancyGuardUpgradeable, OwnableUpgradeable {
     function getCreditLimitRate(
         address _owner,
         uint256 _nftIndex
-    ) public view returns (Rate memory) {
-        return _rateAfterBoosts(baseCreditLimitRate, _owner, _nftIndex);
+    ) public view returns (RateLib.Rate memory) {
+        return
+            _rateAfterBoosts(
+                baseCreditLimitRate,
+                creditLimitRateCap,
+                _owner,
+                _nftIndex
+            );
     }
 
     /// @param _owner The owner of the NFT at index `_nftIndex` (or the owner of the associated position in the vault)
@@ -192,8 +266,14 @@ contract NFTValueProvider is ReentrancyGuardUpgradeable, OwnableUpgradeable {
     function getLiquidationLimitRate(
         address _owner,
         uint256 _nftIndex
-    ) public view returns (Rate memory) {
-        return _rateAfterBoosts(baseLiquidationLimitRate, _owner, _nftIndex);
+    ) public view returns (RateLib.Rate memory) {
+        return
+            _rateAfterBoosts(
+                baseLiquidationLimitRate,
+                liquidationLimitRateCap,
+                _owner,
+                _nftIndex
+            );
     }
 
     /// @param _owner The owner of the NFT at index `_nftIndex` (or the owner of the associated position in the vault)
@@ -203,10 +283,11 @@ contract NFTValueProvider is ReentrancyGuardUpgradeable, OwnableUpgradeable {
         address _owner,
         uint256 _nftIndex
     ) external view returns (uint256) {
-        Rate memory creditLimitRate = getCreditLimitRate(_owner, _nftIndex);
-        return
-            (getNFTValueETH(_nftIndex) * creditLimitRate.numerator) /
-            creditLimitRate.denominator;
+        RateLib.Rate memory _creditLimitRate = getCreditLimitRate(
+            _owner,
+            _nftIndex
+        );
+        return _creditLimitRate.calculate(getNFTValueETH(_nftIndex));
     }
 
     /// @param _owner The owner of the NFT at index `_nftIndex` (or the owner of the associated position in the vault)
@@ -216,52 +297,53 @@ contract NFTValueProvider is ReentrancyGuardUpgradeable, OwnableUpgradeable {
         address _owner,
         uint256 _nftIndex
     ) external view returns (uint256) {
-        Rate memory liquidationLimitRate = getLiquidationLimitRate(
+        RateLib.Rate memory _liquidationLimitRate = getLiquidationLimitRate(
             _owner,
             _nftIndex
         );
-        return
-            (getNFTValueETH(_nftIndex) * liquidationLimitRate.numerator) /
-            liquidationLimitRate.denominator;
+        return _liquidationLimitRate.calculate(getNFTValueETH(_nftIndex));
     }
 
-    /// @param _nftType The NFT type to calculate the JPEG lock amount for
-    /// @param _jpegPrice The JPEG price in ETH (18 decimals)
-    /// @return The JPEG to lock for the specified `_nftType`
+    /// @param _nftType The NFT type to calculate the $JPGD lock amount for
+    /// @param _jpgdTokenPrice The $JPGD price in ETH (18 decimals)
+    /// @return The $JPGD to lock for the specified `_nftType`
     function calculateTraitBoostLock(
         bytes32 _nftType,
-        uint256 _jpegPrice
+        uint256 _jpgdTokenPrice
     ) public view returns (uint256) {
         return
             _calculateTraitBoostLock(
                 traitBoostLockRate,
                 _nftType,
                 getFloorETH(),
-                _jpegPrice
+                _jpgdTokenPrice
             );
     }
 
-    /// @param _jpegPrice The JPEG price in ETH (18 decimals)
-    /// @return The JPEG to lock for the specified `_nftIndex`
+    /// @param _jpgdTokenPrice The $JPGD token price in ETH (18 decimals)
+    /// @return The $JPGD amount to lock for the specified `_nftIndex`
     function calculateLTVBoostLock(
-        uint256 _jpegPrice,
+        uint256 _jpgdTokenPrice,
         uint128 _rateIncreaseBps
     ) external view returns (uint256) {
         if (_rateIncreaseBps >= 10000 || _rateIncreaseBps == 0)
             revert InvalidAmount(_rateIncreaseBps);
 
-        Rate memory _rateIncrease = Rate(_rateIncreaseBps, 10000);
-        if (_greaterThan(_rateIncrease, jpegLockedMaxRateIncrease))
-            revert InvalidRate(_rateIncrease);
+        RateLib.Rate memory _rateIncrease = RateLib.Rate(
+            _rateIncreaseBps,
+            10000
+        );
+        if (_rateIncrease.greaterThan(jpgdTokenLockedMaxRateIncrease))
+            revert RateLib.InvalidRate();
 
-        Rate memory creditLimitRate = baseCreditLimitRate;
+        RateLib.Rate memory _creditLimitRate = baseCreditLimitRate;
         return
             _calculateLTVBoostLock(
-                creditLimitRate,
-                _rateSum(creditLimitRate, _rateIncrease),
+                _creditLimitRate,
+                _creditLimitRate.sum(_rateIncrease),
                 ltvBoostLockRate,
                 getFloorETH(),
-                _jpegPrice
+                _jpgdTokenPrice
             );
     }
 
@@ -274,75 +356,159 @@ contract NFTValueProvider is ReentrancyGuardUpgradeable, OwnableUpgradeable {
     /// @param _nftIndex The NFT to return the value of
     /// @return The value in ETH of the NFT at index `_nftIndex`, with 18 decimals.
     function getNFTValueETH(uint256 _nftIndex) public view returns (uint256) {
-        uint256 floor = getFloorETH();
+        uint256 _floor = getFloorETH();
 
-        bytes32 nftType = nftTypes[_nftIndex];
+        bytes32 _nftType = nftTypes[_nftIndex];
         if (
-            nftType != bytes32(0) &&
-            traitBoostPositions[_nftIndex].unlockAt > block.timestamp
+            _nftType != bytes32(0) &&
+            traitBoostPositions[_nftIndex].owner != address(0)
         ) {
-            Rate memory multiplier = nftTypeValueMultiplier[nftType];
-            return (floor * multiplier.numerator) / multiplier.denominator;
-        } else return floor;
+            uint256 _unlockAt = traitBoostPositions[_nftIndex].unlockAt;
+            if (_unlockAt == 0 || _unlockAt > block.timestamp)
+                return nftTypeValueMultiplier[_nftType].calculate(_floor);
+        }
+        return _floor;
     }
 
-    /// @notice Allows users to lock JPEG tokens to unlock the trait boost for a single non floor NFT.
+    /// @notice Allows users to lock $JPGD tokens to unlock the trait boost for a single non floor NFT.
     /// The trait boost is a multiplicative value increase relative to the collection's floor.
     /// The value increase depends on the NFT's traits and it's set by the DAO.
-    /// The ETH value of the JPEG to lock is calculated by applying the `traitBoostLockRate` rate to the NFT's new credit limit.
-    /// The unlock time is set by the user and has to be greater than `block.timestamp` and the previous unlock time.
-    /// After the lock expires, the boost is revoked and the NFT's value goes back to floor.
-    /// If a boosted position is closed or liquidated, the JPEG remains locked and the boost will still be applied in case the NFT
-    /// is deposited again, even in case of a different owner. The locked JPEG will only be claimable by the original lock creator
-    /// once the lock expires. If the lock is renewed by the new owner, the JPEG from the previous lock will be sent back to the original
-    /// lock creator. Renewing a lock before the expiration date can only cost more JPEG, never less.
+    /// The ETH value of the $JPGD to lock is calculated by applying the `traitBoostLockRate` rate to the NFT's new credit limit.
+    /// The boost can be disabled and the $JPGD can be released by calling {queueTraitBoostRelease}.
+    /// If a boosted position is closed or liquidated, the $JPGD remains locked and the boost will still be applied in case the NFT
+    /// is deposited again, even in case of a different owner. The locked $JPGD will only be claimable by the original lock creator
+    /// once the lock expires. If the lock is renewed by the new owner, the $JPGD from the previous lock will be sent back to the original
+    /// lock creator. Locks can't be overridden while active.
     /// @dev emits multiple {TraitBoostLock} events
     /// @param _nftIndexes The indexes of the non floor NFTs to boost
-    /// @param _unlocks The locks expiration times
     function applyTraitBoost(
-        uint256[] calldata _nftIndexes,
-        uint256[] calldata _unlocks
+        uint256[] calldata _nftIndexes
     ) external nonReentrant {
-        _applyTraitBoost(_nftIndexes, _unlocks);
+        _applyTraitBoost(_nftIndexes);
     }
 
-    /// @notice Allows users to lock JPEG tokens to unlock the LTV boost for a single NFT.
+    /// @notice Allows users to lock $JPGD tokens to unlock the LTV boost for a single NFT.
     /// The LTV boost is an increase of an NFT's credit and liquidation limit rates.
-    /// The ETH value of the JPEG to lock is calculated by applying the `ltvBoostLockRate` rate to the difference between the new and the old credit limits.
+    /// The increase rate is specified by the user, capped at `jpgdTokenLockedMaxRateIncrease`.
+    /// LTV locks can be overridden by the lock owner without releasing them, provided that the specified rate increase is greater than the previous one. No $JPGD is refunded in the process.
+    /// The ETH value of the $JPGD to lock is calculated by applying the `ltvBoostLockRate` rate to the difference between the new and the old credit limits.
     /// See {applyTraitBoost} for details on the locking and unlocking mechanism.
     /// @dev emits multiple {LTVBoostLock} events
     /// @param _nftIndexes The indexes of the NFTs to boost
-    /// @param _unlocks The locks expiration times
     /// @param _rateIncreasesBps The rate increase amounts, in basis points.
     function applyLTVBoost(
         uint256[] calldata _nftIndexes,
-        uint256[] calldata _unlocks,
         uint128[] memory _rateIncreasesBps
     ) external nonReentrant {
-        _applyLTVBoost(_nftIndexes, _unlocks, _rateIncreasesBps);
+        _applyLTVBoost(_nftIndexes, _rateIncreasesBps);
     }
 
-    /// @notice Allows trait boost lock creators to unlock the JPEG associated to the NFT at index `_nftIndex`, provided the lock expired.
+    /// @notice Allows users to queue trait boost locks for release. The boost is disabled when the locked $JPGD becomes available to be claimed,
+    /// `lockReleaseDelay` seconds after calling this function. The $JPGD can then be claimed by calling {withdrawTraitBoost}.
+    /// @dev emits multiple {TraitBoostLockReleaseQueued} events
+    /// @param _nftIndexes The indexes of the locks to queue for release
+    function queueTraitBoostRelease(
+        uint256[] calldata _nftIndexes
+    ) external nonReentrant {
+        _queueLockRelease(_nftIndexes, true);
+    }
+
+    /// @notice Allows users to queue LTV boost locks for release. The boost is disabled when the locked $JPGD becomes available to be claimed,
+    /// `lockReleaseDelay` seconds after calling this function. The $JPGD can then be claimed by calling {withdrawLTVBoost}.
+    /// @dev emits multiple {LTVBoostLockReleaseQueued} events
+    /// @param _nftIndexes The indexes of the locks to queue for release
+    function queueLTVBoostRelease(
+        uint256[] calldata _nftIndexes
+    ) external nonReentrant {
+        _queueLockRelease(_nftIndexes, false);
+    }
+
+    /// @notice Allows users to cancel scheduled trait boost lock releases. The boost is maintained. It can only be called before `lockReleaseDelay` elapses.
+    /// @param _nftIndexes The indexes of the locks to cancel release for
+    /// @dev emits multiple {TraitBoostLockReleaseCancelled} events
+    function cancelTraitBoostRelease(
+        uint256[] calldata _nftIndexes
+    ) external nonReentrant {
+        _cancelLockRelease(_nftIndexes, true);
+    }
+
+    /// @notice Allows users to cancel scheduled ltv boost lock releases. The boost is maintained. It can only be called before `lockReleaseDelay` elapses.
+    /// @param _nftIndexes The indexes of the locks to cancel release for
+    /// @dev emits multiple {LTVBoostLockReleaseCancelled} events
+    function cancelLTVBoostRelease(
+        uint256[] calldata _nftIndexes
+    ) external nonReentrant {
+        _cancelLockRelease(_nftIndexes, false);
+    }
+
+    /// @notice Allows trait boost lock creators to unlock the $JPGD associated to the NFT at index `_nftIndex`, provided the lock has been released.
     /// @dev emits multiple {TraitBoostUnlock} events
     /// @param _nftIndexes The indexes of the NFTs holding the locks.
     function withdrawTraitBoost(
         uint256[] calldata _nftIndexes
     ) external nonReentrant {
-        _unlockJPEG(_nftIndexes, true);
+        _unlockjpgdTokens(_nftIndexes, true);
     }
 
-    /// @notice Allows ltv boost lock creators to unlock the JPEG associated to the NFT at index `_nftIndex`, provided the lock expired.
+    /// @notice Allows ltv boost lock creators to unlock the $JPGD associated to the NFT at index `_nftIndex`, provided the lock has been released.
     /// @dev emits multiple {LTVBoostUnlock} events
     /// @param _nftIndexes The indexes of the NFTs holding the locks.
     function withdrawLTVBoost(
         uint256[] calldata _nftIndexes
     ) external nonReentrant {
-        _unlockJPEG(_nftIndexes, false);
+        _unlockjpgdTokens(_nftIndexes, false);
+    }
+
+    /// @notice Function called by the vaults during liquidation. Deletes all boosts for `_nftIndex` and burns the locked $JPGD.
+    /// @dev emits {TraitBoostLiquidated} and {LTVBoostLiquidated} when `_nftIndex` has active locks.
+    /// @param _nftIndex The NFT that's getting liquidated.
+    function onLiquidation(
+        uint256 _nftIndex
+    ) external nonReentrant onlyRole(VAULT_ROLE) {
+        uint256 _traitBoostLockedValue = traitBoostPositions[_nftIndex]
+            .lockedValue;
+        bool _isTraitBoostNew = traitBoostPositions[_nftIndex].isNewToken;
+        if (_traitBoostLockedValue != 0) {
+            emit TraitBoostLiquidated(
+                traitBoostPositions[_nftIndex].owner,
+                _nftIndex,
+                _traitBoostLockedValue
+            );
+            delete traitBoostPositions[_nftIndex];
+        }
+
+        uint256 _ltvBoostLockedValue = ltvBoostPositions[_nftIndex].lockedValue;
+        bool _isLtvBoostNew = ltvBoostPositions[_nftIndex].isNewToken;
+        if (_ltvBoostLockedValue != 0) {
+            emit LTVBoostLiquidated(
+                ltvBoostPositions[_nftIndex].owner,
+                _nftIndex,
+                _ltvBoostLockedValue
+            );
+            delete ltvBoostPositions[_nftIndex];
+            delete ltvBoostRateIncreases[_nftIndex];
+        }
+
+        uint256 _jpgdTokenToBurn;
+        uint256 _jpegToBurn;
+
+        if (_isTraitBoostNew) _jpgdTokenToBurn = _traitBoostLockedValue;
+        else _jpegToBurn = _traitBoostLockedValue;
+
+        if (_isLtvBoostNew) _jpgdTokenToBurn += _ltvBoostLockedValue;
+        else _jpegToBurn += _ltvBoostLockedValue;
+
+        if (_jpgdTokenToBurn > 0)
+            jpgdToken.transfer(BURN_ADDRESS, _jpgdTokenToBurn);
+
+        if (_jpegToBurn > 0) jpeg.transfer(BURN_ADDRESS, _jpegToBurn);
     }
 
     /// @notice Allows the DAO to bypass the floor oracle and override the NFT floor value
     /// @param _newFloor The new floor
-    function overrideFloor(uint256 _newFloor) external onlyOwner {
+    function overrideFloor(
+        uint256 _newFloor
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (_newFloor == 0) revert InvalidAmount(_newFloor);
         overriddenFloorValueETH = _newFloor;
         daoFloorOverride = true;
@@ -351,7 +517,7 @@ contract NFTValueProvider is ReentrancyGuardUpgradeable, OwnableUpgradeable {
     }
 
     /// @notice Allows the DAO to stop overriding floor
-    function disableFloorOverride() external onlyOwner {
+    function disableFloorOverride() external onlyRole(DEFAULT_ADMIN_ROLE) {
         daoFloorOverride = false;
     }
 
@@ -360,10 +526,11 @@ contract NFTValueProvider is ReentrancyGuardUpgradeable, OwnableUpgradeable {
     /// @param _multiplier The new multiplier
     function setNFTTypeMultiplier(
         bytes32 _type,
-        Rate calldata _multiplier
-    ) external onlyOwner {
+        RateLib.Rate calldata _multiplier
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (_type == bytes32(0)) revert InvalidNFTType(_type);
-        _validateRateAboveOne(_multiplier);
+        if (!_multiplier.isValid() || _multiplier.isBelowOne())
+            revert RateLib.InvalidRate();
         nftTypeValueMultiplier[_type] = _multiplier;
     }
 
@@ -373,7 +540,7 @@ contract NFTValueProvider is ReentrancyGuardUpgradeable, OwnableUpgradeable {
     function setNFTType(
         uint256[] calldata _nftIndexes,
         bytes32 _type
-    ) external onlyOwner {
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (_type != bytes32(0) && nftTypeValueMultiplier[_type].numerator == 0)
             revert InvalidNFTType(_type);
 
@@ -383,71 +550,77 @@ contract NFTValueProvider is ReentrancyGuardUpgradeable, OwnableUpgradeable {
     }
 
     function setBaseCreditLimitRate(
-        Rate memory _baseCreditLimitRate
-    ) external onlyOwner {
+        RateLib.Rate memory _baseCreditLimitRate
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
         _validateRateBelowOne(_baseCreditLimitRate);
-        if (!_greaterThan(baseLiquidationLimitRate, _baseCreditLimitRate))
-            revert InvalidRate(_baseCreditLimitRate);
+        if (_baseCreditLimitRate.greaterThan(creditLimitRateCap))
+            revert RateLib.InvalidRate();
+        if (!baseLiquidationLimitRate.greaterThan(_baseCreditLimitRate))
+            revert RateLib.InvalidRate();
 
         baseCreditLimitRate = _baseCreditLimitRate;
     }
 
     function setBaseLiquidationLimitRate(
-        Rate memory _liquidationLimitRate
-    ) external onlyOwner {
+        RateLib.Rate memory _liquidationLimitRate
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
         _validateRateBelowOne(_liquidationLimitRate);
-
-        if (!_greaterThan(_liquidationLimitRate, baseCreditLimitRate))
-            revert InvalidRate(_liquidationLimitRate);
-
-        _validateRateBelowOne(
-            _rateSum(
-                _rateSum(_liquidationLimitRate, cigStakedRateIncrease),
-                jpegLockedMaxRateIncrease
-            )
-        );
+        if (_liquidationLimitRate.greaterThan(liquidationLimitRateCap))
+            revert RateLib.InvalidRate();
+        if (!_liquidationLimitRate.greaterThan(baseCreditLimitRate))
+            revert RateLib.InvalidRate();
 
         baseLiquidationLimitRate = _liquidationLimitRate;
     }
 
-    function setCigStakedRateIncrease(
-        Rate memory _cigStakedRateIncrease
-    ) external onlyOwner {
-        _validateRateBelowOne(_cigStakedRateIncrease);
-        _validateRateBelowOne(
-            _rateSum(
-                _rateSum(baseLiquidationLimitRate, _cigStakedRateIncrease),
-                jpegLockedMaxRateIncrease
-            )
-        );
+    function setCreditLimitRateCap(
+        RateLib.Rate memory _creditLimitRate
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _validateRateBelowOne(_creditLimitRate);
+        if (baseCreditLimitRate.greaterThan(_creditLimitRate))
+            revert RateLib.InvalidRate();
+        if (!liquidationLimitRateCap.greaterThan(_creditLimitRate))
+            revert RateLib.InvalidRate();
 
+        creditLimitRateCap = _creditLimitRate;
+    }
+
+    function setLiquidationLimitRateCap(
+        RateLib.Rate memory _liquidationLimitRate
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _validateRateBelowOne(_liquidationLimitRate);
+        if (baseLiquidationLimitRate.greaterThan(_liquidationLimitRate))
+            revert RateLib.InvalidRate();
+        if (!_liquidationLimitRate.greaterThan(creditLimitRateCap))
+            revert RateLib.InvalidRate();
+
+        liquidationLimitRateCap = _liquidationLimitRate;
+    }
+
+    function setCigStakedRateIncrease(
+        RateLib.Rate memory _cigStakedRateIncrease
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _validateRateBelowOne(_cigStakedRateIncrease);
         cigStakedRateIncrease = _cigStakedRateIncrease;
     }
 
-    function setJPEGLockedMaxRateIncrease(
-        Rate memory _jpegLockedRateIncrease
-    ) external onlyOwner {
-        _validateRateBelowOne(_jpegLockedRateIncrease);
-        _validateRateBelowOne(
-            _rateSum(
-                _rateSum(baseLiquidationLimitRate, cigStakedRateIncrease),
-                _jpegLockedRateIncrease
-            )
-        );
-
-        jpegLockedMaxRateIncrease = _jpegLockedRateIncrease;
+    function setjpgdTokenLockedMaxRateIncrease(
+        RateLib.Rate memory _jpgdTokenLockedRateIncrease
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _validateRateBelowOne(_jpgdTokenLockedRateIncrease);
+        jpgdTokenLockedMaxRateIncrease = _jpgdTokenLockedRateIncrease;
     }
 
     function setTraitBoostLockRate(
-        Rate memory _traitBoostLockRate
-    ) external onlyOwner {
+        RateLib.Rate memory _traitBoostLockRate
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
         _validateRateBelowOne(_traitBoostLockRate);
         traitBoostLockRate = _traitBoostLockRate;
     }
 
     function setLTVBoostLockRate(
-        Rate memory _ltvBoostLockRate
-    ) external onlyOwner {
+        RateLib.Rate memory _ltvBoostLockRate
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
         _validateRateBelowOne(_ltvBoostLockRate);
         ltvBoostLockRate = _ltvBoostLockRate;
     }
@@ -455,161 +628,238 @@ contract NFTValueProvider is ReentrancyGuardUpgradeable, OwnableUpgradeable {
     ///@dev See {applyLTVBoost}
     function _applyLTVBoost(
         uint256[] memory _nftIndexes,
-        uint256[] memory _unlocks,
         uint128[] memory _rateIncreasesBps
     ) internal {
-        if (_nftIndexes.length != _unlocks.length) revert InvalidLength();
+        if (
+            _nftIndexes.length != _rateIncreasesBps.length ||
+            _nftIndexes.length == 0
+        ) revert InvalidLength();
 
-        Rate memory _baseCreditLimit = baseCreditLimitRate;
-        Rate memory _maxRateIncrease = jpegLockedMaxRateIncrease;
-        Rate memory _lockRate = ltvBoostLockRate;
+        RateLib.Rate memory _baseCreditLimit = baseCreditLimitRate;
+        RateLib.Rate memory _maxRateIncrease = jpgdTokenLockedMaxRateIncrease;
+        RateLib.Rate memory _lockRate = ltvBoostLockRate;
 
-        IERC20Upgradeable _jpeg = jpeg;
+        IERC20Upgradeable _jpgdToken = jpgdToken;
         uint256 _floor = getFloorETH();
-        uint256 _jpegPrice = _jpegPriceETH();
-        uint256 _minLock = minJPEGToLock;
-        uint256 _requiredJPEG;
-        uint256 _jpegToRefund;
+        uint256 _jpgdTokenPrice = _jpgdTokenPriceETH();
+        uint256 _minLock = minjpgdTokenToLock;
+        uint256 _requiredjpgdTokens;
+        uint256 _jpgdTokensToRefund;
 
         for (uint256 i; i < _nftIndexes.length; ++i) {
             if (_rateIncreasesBps[i] >= 10000 || _rateIncreasesBps[i] == 0)
                 revert InvalidAmount(_rateIncreasesBps[i]);
 
-            Rate memory _rateIncrease = Rate(_rateIncreasesBps[i], 10000);
+            RateLib.Rate memory _rateIncrease = RateLib.Rate(
+                _rateIncreasesBps[i],
+                10000
+            );
 
-            if (_greaterThan(_rateIncrease, _maxRateIncrease))
-                revert InvalidRate(_rateIncrease);
+            if (_rateIncrease.greaterThan(_maxRateIncrease))
+                revert RateLib.InvalidRate();
 
-            uint256 _jpegToLock = _calculateLTVBoostLock(
+            uint256 _nftToLock = _calculateLTVBoostLock(
                 _baseCreditLimit,
-                _rateSum(_baseCreditLimit, _rateIncrease),
+                _baseCreditLimit.sum(_rateIncrease),
                 _lockRate,
                 _floor,
-                _jpegPrice
+                _jpgdTokenPrice
             );
 
             uint256 _index = _nftIndexes[i];
-            uint256 _unlockAt = _unlocks[i];
-
             JPEGLock memory _lock = ltvBoostPositions[_index];
-            if (block.timestamp >= _unlockAt || _lock.unlockAt >= _unlockAt)
-                revert InvalidUnlockTime(_unlockAt);
 
-            if (_lock.unlockAt >= block.timestamp) {
-                Rate memory _currentIncrease = ltvBoostRateIncreases[_index];
-                if (_greaterThan(_currentIncrease, _rateIncrease))
-                    revert InvalidRate(_rateIncrease);
+            //prevent increasing ltv boost rate if lock is queued for withdrawal
+            if (_lock.unlockAt > block.timestamp) revert LockExists(_index);
 
-                if (_lock.lockedValue > _jpegToLock)
-                    _jpegToLock = _lock.lockedValue;
-            } else if (_minLock > _jpegToLock) _jpegToLock = _minLock;
+            if (_lock.owner != address(0) && _lock.unlockAt == 0) {
+                if (
+                    _lock.owner != msg.sender ||
+                    !_rateIncrease.greaterThan(ltvBoostRateIncreases[_index])
+                ) revert LockExists(_index);
+                else {
+                    if (!_lock.isNewToken && _lock.lockedValue > 0) {
+                        jpeg.safeTransfer(_lock.owner, _lock.lockedValue);
+                        _lock.lockedValue = 0;
+                    } else if (_lock.lockedValue > _nftToLock)
+                        _nftToLock = _lock.lockedValue;
+                }
+            }
 
-            _requiredJPEG += _jpegToLock;
+            if (_minLock > _nftToLock) _nftToLock = _minLock;
 
-            if (_lock.owner == msg.sender) _jpegToRefund += _lock.lockedValue;
+            _requiredjpgdTokens += _nftToLock;
+
+            if (_lock.owner == msg.sender)
+                _jpgdTokensToRefund += _lock.lockedValue;
             else if (_lock.lockedValue > 0)
-                _jpeg.safeTransfer(_lock.owner, _lock.lockedValue);
+                _jpgdToken.safeTransfer(_lock.owner, _lock.lockedValue);
 
             ltvBoostPositions[_index] = JPEGLock(
                 msg.sender,
-                _unlockAt,
-                _jpegToLock
+                0,
+                _nftToLock,
+                true
             );
             ltvBoostRateIncreases[_index] = _rateIncrease;
 
-            emit LTVBoostLock(
+            emit LTVBoost(
                 msg.sender,
                 _index,
-                _jpegToLock,
-                _unlockAt,
+                _nftToLock,
                 _rateIncrease.numerator
             );
         }
 
-        if (_requiredJPEG > _jpegToRefund)
-            _jpeg.safeTransferFrom(
+        if (_requiredjpgdTokens > _jpgdTokensToRefund)
+            _jpgdToken.safeTransferFrom(
                 msg.sender,
                 address(this),
-                _requiredJPEG - _jpegToRefund
+                _requiredjpgdTokens - _jpgdTokensToRefund
             );
-        else if (_requiredJPEG < _jpegToRefund)
-            _jpeg.safeTransfer(msg.sender, _jpegToRefund - _requiredJPEG);
+        else if (_requiredjpgdTokens < _jpgdTokensToRefund)
+            _jpgdToken.safeTransfer(
+                msg.sender,
+                _jpgdTokensToRefund - _requiredjpgdTokens
+            );
     }
 
     /// @dev see {applyTraitBoost}
-    function _applyTraitBoost(
-        uint256[] memory _nftIndexes,
-        uint256[] memory _unlocks
-    ) internal {
-        if (_nftIndexes.length != _unlocks.length) revert InvalidLength();
+    function _applyTraitBoost(uint256[] memory _nftIndexes) internal {
+        if (_nftIndexes.length == 0) revert InvalidLength();
 
-        Rate memory _lockRate = traitBoostLockRate;
+        RateLib.Rate memory _lockRate = traitBoostLockRate;
 
-        IERC20Upgradeable _jpeg = jpeg;
+        IERC20Upgradeable _jpgdToken = jpgdToken;
         uint256 _floor = getFloorETH();
-        uint256 _jpegPrice = _jpegPriceETH();
-        uint256 _minLock = minJPEGToLock;
-        uint256 _requiredJPEG;
-        uint256 _jpegToRefund;
+        uint256 _jpgdTokenPrice = _jpgdTokenPriceETH();
+        uint256 _minLock = minjpgdTokenToLock;
+        uint256 _requiredjpgdTokens;
+        uint256 _jpgdTokensToRefund;
 
         for (uint256 i; i < _nftIndexes.length; ++i) {
             uint256 _index = _nftIndexes[i];
-            uint256 _unlockAt = _unlocks[i];
 
             bytes32 _nftType = nftTypes[_index];
             if (_nftType == bytes32(0)) revert InvalidNFTType(_nftType);
 
             JPEGLock memory _lock = traitBoostPositions[_index];
-            if (block.timestamp >= _unlockAt || _lock.unlockAt >= _unlockAt)
-                revert InvalidUnlockTime(_unlockAt);
 
-            uint256 _jpegToLock = _calculateTraitBoostLock(
+            if (
+                _lock.owner != address(0) &&
+                (_lock.unlockAt == 0 || _lock.unlockAt > block.timestamp)
+            ) revert LockExists(_index);
+
+            if (!_lock.isNewToken && _lock.lockedValue > 0) {
+                jpeg.safeTransfer(_lock.owner, _lock.lockedValue);
+                _lock.lockedValue = 0;
+            }
+
+            uint256 _nftToLock = _calculateTraitBoostLock(
                 _lockRate,
                 _nftType,
                 _floor,
-                _jpegPrice
+                _jpgdTokenPrice
             );
 
-            if (
-                _lock.unlockAt >= block.timestamp &&
-                _lock.lockedValue > _jpegToLock
-            ) _jpegToLock = _lock.lockedValue;
-            else if (_minLock > _jpegToLock) revert InvalidNFTType(_nftType);
+            if (_minLock > _nftToLock) revert InvalidNFTType(_nftType);
 
-            _requiredJPEG += _jpegToLock;
+            _requiredjpgdTokens += _nftToLock;
 
-            if (_lock.owner == msg.sender) _jpegToRefund += _lock.lockedValue;
+            if (_lock.owner == msg.sender)
+                _jpgdTokensToRefund += _lock.lockedValue;
             else if (_lock.lockedValue > 0)
-                _jpeg.safeTransfer(_lock.owner, _lock.lockedValue);
+                _jpgdToken.safeTransfer(_lock.owner, _lock.lockedValue);
 
             traitBoostPositions[_index] = JPEGLock(
                 msg.sender,
-                _unlockAt,
-                _jpegToLock
+                0,
+                _nftToLock,
+                true
             );
 
-            emit TraitBoostLock(msg.sender, _index, _jpegToLock, _unlockAt);
+            emit TraitBoost(msg.sender, _index, _nftToLock);
         }
 
-        if (_requiredJPEG > _jpegToRefund)
-            _jpeg.safeTransferFrom(
+        if (_requiredjpgdTokens > _jpgdTokensToRefund)
+            _jpgdToken.safeTransferFrom(
                 msg.sender,
                 address(this),
-                _requiredJPEG - _jpegToRefund
+                _requiredjpgdTokens - _jpgdTokensToRefund
             );
-        else if (_requiredJPEG < _jpegToRefund)
-            _jpeg.safeTransfer(msg.sender, _jpegToRefund - _requiredJPEG);
+        else if (_requiredjpgdTokens < _jpgdTokensToRefund)
+            _jpgdToken.safeTransfer(
+                msg.sender,
+                _jpgdTokensToRefund - _requiredjpgdTokens
+            );
     }
 
-    /// @dev See {withdrawTraitBoost} and {withdrawLTVBoost}
-    function _unlockJPEG(
+    function _queueLockRelease(
         uint256[] calldata _nftIndexes,
         bool _isTraitBoost
     ) internal {
         uint256 _length = _nftIndexes.length;
         if (_length == 0) revert InvalidLength();
 
-        uint256 _jpegToSend;
+        uint256 _unlockTime = block.timestamp + lockReleaseDelay;
+        for (uint256 i; i < _length; ++i) {
+            uint256 _index = _nftIndexes[i];
+            JPEGLock memory _lock;
+
+            if (_isTraitBoost) {
+                _lock = traitBoostPositions[_index];
+                traitBoostPositions[_index].unlockAt = _unlockTime;
+
+                emit TraitBoostReleaseQueued(_lock.owner, _index, _unlockTime);
+            } else {
+                _lock = ltvBoostPositions[_index];
+                ltvBoostPositions[_index].unlockAt = _unlockTime;
+
+                emit LTVBoostReleaseQueued(_lock.owner, _index, _unlockTime);
+            }
+
+            if (_lock.owner != msg.sender || _lock.unlockAt != 0)
+                revert Unauthorized();
+        }
+    }
+
+    function _cancelLockRelease(
+        uint256[] calldata _nftIndexes,
+        bool _isTraitBoost
+    ) internal {
+        uint256 _length = _nftIndexes.length;
+        if (_length == 0) revert InvalidLength();
+
+        for (uint256 i; i < _length; ++i) {
+            uint256 _index = _nftIndexes[i];
+            JPEGLock memory _lock;
+
+            if (_isTraitBoost) {
+                _lock = traitBoostPositions[_index];
+                traitBoostPositions[_index].unlockAt = 0;
+
+                emit TraitBoostReleaseCancelled(_lock.owner, _index);
+            } else {
+                _lock = ltvBoostPositions[_index];
+                ltvBoostPositions[_index].unlockAt = 0;
+
+                emit LTVBoostReleaseCancelled(_lock.owner, _index);
+            }
+
+            if (_lock.owner != msg.sender || block.timestamp >= _lock.unlockAt)
+                revert Unauthorized();
+        }
+    }
+
+    /// @dev See {withdrawTraitBoost} and {withdrawLTVBoost}
+    function _unlockjpgdTokens(
+        uint256[] calldata _nftIndexes,
+        bool _isTraitBoost
+    ) internal {
+        uint256 _length = _nftIndexes.length;
+        if (_length == 0) revert InvalidLength();
+
+        uint256 _nftToSend;
         for (uint256 i; i < _length; ++i) {
             uint256 _index = _nftIndexes[i];
             JPEGLock memory _lock;
@@ -626,23 +876,30 @@ contract NFTValueProvider is ReentrancyGuardUpgradeable, OwnableUpgradeable {
                 emit LTVBoostUnlock(msg.sender, _index, _lock.lockedValue);
             }
 
-            if (_lock.owner != msg.sender) revert Unauthorized();
+            if (
+                _lock.owner != msg.sender ||
+                _lock.unlockAt == 0 ||
+                _lock.unlockAt > block.timestamp
+            ) revert Unauthorized();
 
-            if (block.timestamp < _lock.unlockAt) revert Unauthorized();
+            if (!_lock.isNewToken && _lock.lockedValue > 0) {
+                jpeg.safeTransfer(_lock.owner, _lock.lockedValue);
+                _lock.lockedValue = 0;
+            }
 
-            _jpegToSend += _lock.lockedValue;
+            _nftToSend += _lock.lockedValue;
         }
 
-        jpeg.safeTransfer(msg.sender, _jpegToSend);
+        jpgdToken.safeTransfer(msg.sender, _nftToSend);
     }
 
     function _calculateTraitBoostLock(
-        Rate memory _lockRate,
+        RateLib.Rate memory _lockRate,
         bytes32 _nftType,
         uint256 _floor,
-        uint256 _jpegPrice
+        uint256 _jpgdTokenPrice
     ) internal view returns (uint256) {
-        Rate memory multiplier = nftTypeValueMultiplier[_nftType];
+        RateLib.Rate memory multiplier = nftTypeValueMultiplier[_nftType];
 
         if (multiplier.numerator == 0 || multiplier.denominator == 0) return 0;
 
@@ -653,15 +910,15 @@ contract NFTValueProvider is ReentrancyGuardUpgradeable, OwnableUpgradeable {
                 1 ether *
                 _lockRate.numerator) /
             _lockRate.denominator /
-            _jpegPrice;
+            _jpgdTokenPrice;
     }
 
     function _calculateLTVBoostLock(
-        Rate memory _creditLimitRate,
-        Rate memory _boostedCreditLimitRate,
-        Rate memory _lockRate,
+        RateLib.Rate memory _creditLimitRate,
+        RateLib.Rate memory _boostedCreditLimitRate,
+        RateLib.Rate memory _lockRate,
         uint256 _floor,
-        uint256 _jpegPrice
+        uint256 _jpgdTokenPrice
     ) internal pure returns (uint256) {
         uint256 baseCreditLimit = (_floor * _creditLimitRate.numerator) /
             _creditLimitRate.denominator;
@@ -671,64 +928,52 @@ contract NFTValueProvider is ReentrancyGuardUpgradeable, OwnableUpgradeable {
 
         return
             ((((boostedCreditLimit - baseCreditLimit) * _lockRate.numerator) /
-                _lockRate.denominator) * 1 ether) / _jpegPrice;
+                _lockRate.denominator) * 1 ether) / _jpgdTokenPrice;
     }
 
     function _rateAfterBoosts(
-        Rate memory _baseRate,
+        RateLib.Rate memory _baseRate,
+        RateLib.Rate memory _cap,
         address _owner,
         uint256 _nftIndex
-    ) internal view returns (Rate memory) {
-        if (cigStaking.isUserStaking(_owner)) {
-            _baseRate = _rateSum(_baseRate, cigStakedRateIncrease);
+    ) internal view returns (RateLib.Rate memory) {
+        if (cigStaking.isUserStaking(_owner))
+            _baseRate = _baseRate.sum(cigStakedRateIncrease);
+
+        if (ltvBoostPositions[_nftIndex].owner != address(0)) {
+            uint256 _unlockAt = ltvBoostPositions[_nftIndex].unlockAt;
+            if (_unlockAt == 0 || _unlockAt > block.timestamp)
+                _baseRate = _baseRate.sum(ltvBoostRateIncreases[_nftIndex]);
         }
-        if (ltvBoostPositions[_nftIndex].unlockAt > block.timestamp) {
-            _baseRate = _rateSum(_baseRate, ltvBoostRateIncreases[_nftIndex]);
-        }
+
+        if (_baseRate.greaterThan(_cap)) return _cap;
 
         return _baseRate;
     }
 
-    /// @dev Returns the current JPEG price in ETH
-    /// @return result The current JPEG price, 18 decimals
-    function _jpegPriceETH() internal returns (uint256) {
-        return aggregator.consultJPEGPriceETH(address(jpeg));
-    }
+    /// @dev Returns the current NFT price in ETH
+    /// @return result The current NFT price, 18 decimals
+    function _jpgdTokenPriceETH() internal view returns (uint256) {
+        IAggregatorV3Interface _oracle = jpgdTokenOracle;
+        (, int256 _answer, , uint256 _timestamp, ) = _oracle.latestRoundData();
 
-    /// @dev Validates a rate. The denominator must be greater than zero and less than or equal to the numerator.
-    /// @param _rate The rate to validate
-    function _validateRateAboveOne(Rate memory _rate) internal pure {
-        if (_rate.denominator == 0 || _rate.numerator < _rate.denominator)
-            revert InvalidRate(_rate);
+        if (_answer == 0 || _timestamp == 0) revert InvalidOracleResults();
+
+        uint8 _decimals = _oracle.decimals();
+
+        unchecked {
+            //converts the answer to have 18 decimals
+            return
+                _decimals > 18
+                    ? uint256(_answer) / 10 ** (_decimals - 18)
+                    : uint256(_answer) * 10 ** (18 - _decimals);
+        }
     }
 
     /// @dev Validates a rate. The denominator must be greater than zero and greater than or equal to the numerator.
     /// @param _rate The rate to validate
-    function _validateRateBelowOne(Rate memory _rate) internal pure {
-        if (_rate.denominator == 0 || _rate.denominator < _rate.numerator)
-            revert InvalidRate(_rate);
-    }
-
-    /// @dev Checks if `r1` is greater than `r2`.
-    function _greaterThan(
-        Rate memory _r1,
-        Rate memory _r2
-    ) internal pure returns (bool) {
-        return
-            _r1.numerator * _r2.denominator > _r2.numerator * _r1.denominator;
-    }
-
-    function _rateSum(
-        Rate memory _r1,
-        Rate memory _r2
-    ) internal pure returns (Rate memory) {
-        return
-            Rate({
-                numerator: _r1.numerator *
-                    _r2.denominator +
-                    _r1.denominator *
-                    _r2.numerator,
-                denominator: _r1.denominator * _r2.denominator
-            });
+    function _validateRateBelowOne(RateLib.Rate memory _rate) internal pure {
+        if (!_rate.isValid() || _rate.isAboveOne())
+            revert RateLib.InvalidRate();
     }
 }
