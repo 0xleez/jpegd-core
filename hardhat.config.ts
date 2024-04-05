@@ -75,7 +75,8 @@ module.exports = {
                         ? [process.env.PRIVATE_KEY]
                         : []
                 }
-            }
+            },
+            { version: "0.8.8" }
         ]
     },
     paths: {
