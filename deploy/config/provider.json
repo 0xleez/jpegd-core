@@ -1,0 +1,37 @@
+{
+    "rates": {
+        "baseCreditLimitRate": [
+            60,
+            100
+        ],
+        "baseLiquidationLimitRate": [
+            70,
+            100
+        ],
+        "cigStakedRateIncrease": [
+            10,
+            100
+        ],
+        "jpgdTokenLockedMaxRateIncrease": [
+            1000,
+            10000
+        ],
+        "traitBoostLockRate": [
+            35,
+            1000
+        ],
+        "ltvBoostLockRate": [
+            20,
+            100
+        ],
+        "creditLimitRateCap": [
+            70,
+            100
+        ],
+        "liquidationLimitRateCap": [
+            80,
+            100
+        ]
+    },
+    "lockReleaseDelay": "604800"
+}

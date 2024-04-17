@@ -1,7 +1,7 @@
 import dotenv from "dotenv";
+import "@nomicfoundation/hardhat-verify";
 import "@nomicfoundation/hardhat-chai-matchers";
 import "@nomiclabs/hardhat-ethers";
-import "@nomiclabs/hardhat-etherscan";
 import "@typechain/hardhat";
 import "@openzeppelin/hardhat-upgrades";
 import "hardhat-gas-reporter";
@@ -50,6 +50,12 @@ module.exports = {
                 process.env.ALCHEMY_API_KEY,
             accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY] : []
         },
+        arbitrumSepolia: {
+            url:
+                // "https://arb-sepolia.g.alchemyapi.io/v2/" + process.env.ALCHEMY_API_KEY
+                "https://sepolia-rollup.arbitrum.io/rpc",
+            accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY] : []
+        },
         mainnet: {
             url:
                 "https://eth-mainnet.alchemyapi.io/v2/" +
@@ -66,17 +72,26 @@ module.exports = {
                         enabled: true,
                         runs: 300
                     }
-                },
-                mainnet: {
-                    url:
-                        "https://eth-mainnet.alchemyapi.io/v2/" +
-                        process.env.ALCHEMY_API_KEY,
-                    accounts: process.env.PRIVATE_KEY
-                        ? [process.env.PRIVATE_KEY]
-                        : []
                 }
             },
-            { version: "0.8.8" }
+            {
+                version: "0.8.8",
+                settings: {
+                    optimizer: {
+                        enabled: true,
+                        runs: 300
+                    }
+                }
+            },
+            {
+                version: "0.8.9",
+                settings: {
+                    optimizer: {
+                        enabled: true,
+                        runs: 300
+                    }
+                }
+            }
         ]
     },
     paths: {
@@ -89,7 +104,28 @@ module.exports = {
         timeout: 200000
     },
     etherscan: {
-        apiKey: process.env.ETHERSCAN_API_KEY
+        apiKey: {
+            mainnet: process.env.ETHERSCAN_API_KEY,
+            goerli: process.env.ETHERSCAN_API_KEY,
+            arbitrumSepolia: process.env.ARBISCAN_API_KEY
+        },
+        customChains: [
+            {
+                network: "arbitrumSepolia",
+                chainId: 421614,
+                urls: {
+                    apiURL: "https://api-sepolia.arbiscan.io/api",
+                    browserURL: "https://sepolia.arbiscan.io/"
+                }
+            }
+        ]
+    },
+    sourcify: {
+        enabled: false,
+        // Optional: specify a different Sourcify server
+        apiUrl: "https://sourcify.dev/server",
+        // Optional: specify a different Sourcify repository
+        browserUrl: "https://repo.sourcify.dev"
     },
     abiExporter: {
         path: "./abi",

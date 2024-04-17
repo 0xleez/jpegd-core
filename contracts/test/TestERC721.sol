@@ -4,10 +4,11 @@ pragma solidity ^0.8.4;
 import "@openzeppelin/contracts/token/ERC721/extensions/ERC721Enumerable.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
-// This contract is only for testing
-contract TestERC721 is ERC721("TEST", "TEST") {
-    function mint(address to, uint256 index) external {
-        _mint(to, index);
+contract TestERC721 is ERC721Enumerable, Ownable {
+    constructor() ERC721("Test", "TEST") {}
+
+    function mint(address to, uint256 tokenId) external onlyOwner {
+        _mint(to, tokenId);
     }
 
     function ownerOf(uint256 tokenId) public view override returns (address) {
